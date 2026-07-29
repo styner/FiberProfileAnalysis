@@ -86,6 +86,8 @@ OUTPUT_SUFFIX = "_agebinstats.csv"
 PERCENTILES = [1, 5, 25, 50, 75, 95, 99]
 # Preferred metric ordering for the plot subplot grid; others appended.
 METRIC_ORDER = ["fa", "md", "rd", "ad", "NDI", "ODI", "FWF"]
+# The four DTI metrics shown in the excluded-profiles review figures.
+DIFFUSION_METRICS = ["fa", "md", "rd", "ad"]
 # Colour-blind-friendly colours, one per age bin (extended if more bins).
 BIN_COLORS = ["#4C72B0", "#DD8452", "#55A868", "#C44E52", "#8172B3", "#937860"]
 
@@ -644,6 +646,86 @@ def write_without_columns(in_path, out_path, drop_names, drop_subject_sessions=(
             fh.write(",".join(parts[i] for i in keep) + "\n")
 
 
+def plot_excluded_profiles(inputs, prior_dir, bins, envelope_cfg, prof_outliers_by_tract,
+                           reg_ss, full_excl, batch_shifts, out_dir, dpi):
+    """Per tract: FA/MD/RD/AD subplots of the normative mean+envelope (per age bin)
+    with every excluded profile overlaid (colour = bin, solid = profile-QC
+    outlier, dashed = registration/preprocessing exclusion)."""
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+
+    by_tract = {}
+    for f in inputs:
+        tract = os.path.basename(os.path.dirname(f))
+        metric = os.path.basename(f)[: -len(".csv")].rsplit("_", 1)[1]
+        by_tract.setdefault(tract, {})[metric] = f
+
+    os.makedirs(out_dir, exist_ok=True)
+    written = 0
+    for tract, mpaths in sorted(by_tract.items()):
+        avail = [m for m in DIFFUSION_METRICS if m in mpaths]
+        if not avail:
+            continue
+        cols0 = pd.read_csv(mpaths[avail[0]], index_col=0, nrows=0).columns
+        prof_set = prof_outliers_by_tract.get(tract, set())
+        excl = [c for c in cols0
+                if c in prof_set or subject_session_of(c) in reg_ss or c in full_excl]
+        if not excl:
+            continue
+
+        n_metrics, n_bins = len(DIFFUSION_METRICS), len(bins)
+        fig, axes = plt.subplots(n_metrics, n_bins, figsize=(4.0 * n_bins, 2.8 * n_metrics),
+                                 squeeze=False, sharex=True, sharey="row")
+        for r, metric in enumerate(DIFFUSION_METRICS):
+            if metric not in mpaths:
+                for c in range(n_bins):
+                    axes[r][c].set_visible(False)
+                continue
+            df = pd.read_csv(mpaths[metric], index_col=0)
+            x = df.index.to_numpy(dtype=float)
+            prior_path = find_prior_stats(prior_dir, tract, metric)
+            prior = pd.read_csv(prior_path, index_col=0).reindex(df.index) if prior_path else None
+            for c, (_, _, label) in enumerate(bins):
+                ax = axes[r][c]
+                color = BIN_COLORS[c % len(BIN_COLORS)]
+                if prior is not None and f"{label}_mean" in prior.columns:
+                    ax.plot(x, prior[f"{label}_mean"].to_numpy(dtype=float), color=color, lw=1.4, zorder=3)
+                    env = envelope_bounds(prior, label, envelope_cfg)
+                    if env is not None:
+                        ax.fill_between(x, env[0], env[1], color=color, alpha=0.13, linewidth=0, zorder=1)
+                n_cell = 0
+                for col in excl:
+                    if col not in df.columns or bin_label_for_age(age_of(col), bins) != label:
+                        continue
+                    v = df[col].to_numpy(dtype=float)
+                    v = _apply_batch_shift(v[:, None], metric, label, batch_shifts)[:, 0]
+                    ax.plot(x, v, color=color, lw=0.7, alpha=0.75,
+                            ls="-" if col in prof_set else "--", zorder=2)
+                    n_cell += 1
+                if n_cell:
+                    ax.text(0.02, 0.96, f"n={n_cell}", transform=ax.transAxes, va="top", fontsize=7, color="#333")
+                if r == 0:
+                    ax.set_title(label, fontsize=11)
+                if c == 0:
+                    ax.set_ylabel(metric, fontsize=10)
+                if r == n_metrics - 1:
+                    ax.set_xlabel("Arc length", fontsize=8)
+                ax.tick_params(labelsize=7)
+                ax.margins(x=0)
+
+        handles = [Line2D([0], [0], color="#444444", lw=1, ls="-", label="profile-QC outlier"),
+                   Line2D([0], [0], color="#444444", lw=1, ls="--", label="reg/prep excluded")]
+        fig.legend(handles=handles, loc="lower center", ncol=2, fontsize=8, frameon=False)
+        corr = " (batch-corrected)" if batch_shifts else ""
+        fig.suptitle(f"{tract} — {len(excl)} excluded profiles vs normative mean ± envelope "
+                     f"(rows: metric, cols: age bin){corr}", fontsize=12)
+        fig.tight_layout(rect=(0, 0.04, 1, 0.96))
+        fig.savefig(os.path.join(out_dir, f"{tract}_excluded_profiles.png"), dpi=dpi)
+        plt.close(fig)
+        written += 1
+    return written
+
+
 def _corr_violin_figure(sub_df, title, out_path, reference, dpi):
     """One large box+violin figure of per-tract correlation for a data subset."""
     import matplotlib.pyplot as plt
@@ -894,6 +976,16 @@ def main(argv=None) -> int:
             n_fig = plot_correlations_by_metric_bin(qc, plots_sub, args.corr_reference, args.dpi, bins)
             log.info("Wrote %d correlation QC plots (one per metric x age-bin) under %s/",
                      n_fig, plots_sub)
+
+        # --- per-tract review figures: excluded profiles vs mean+envelope --
+        if plots_sub:
+            prof_outliers_by_tract = (groups[groups["is_outlier"]]
+                                      .groupby("tract")["subject_session"].apply(set).to_dict())
+            excl_dir = os.path.join(plots_sub, "excluded")
+            n_excl = plot_excluded_profiles(inputs, args.prior_stats_dir, bins, env_cfg,
+                                            prof_outliers_by_tract, reg_ss, full_excl, batch_shifts,
+                                            excl_dir, args.dpi)
+            log.info("Wrote %d excluded-profile review plots under %s/", n_excl, excl_dir)
 
         # --- apply outliers -> cleaned profiles + recomputed stats ---------
         if args.clean_dir:
