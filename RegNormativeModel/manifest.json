@@ -1,0 +1,15 @@
+{
+  "bins": [
+    "0-3m",
+    "4-9m",
+    "10-60m"
+  ],
+  "scalar_metrics": [
+    "FA"
+  ],
+  "angular": true,
+  "mask_threshold": 0.001,
+  "angular_fa_min": 0.2,
+  "min_count": 2,
+  "tensor_flip": "none"
+}
