@@ -43,7 +43,11 @@ per **(subject-session, tract)** and applied to every metric of that tract:
       when the joint fraction drops below ``--value-min-inside``.
       ``--outlier-exclude-metrics`` (default ``FWF``) drops metrics from this
       computation -- e.g. FWF is a CSF-contamination metric rarely analysed --
-      while the resulting decision is still applied to them.
+      while the resulting decision is still applied to them.  ``--envelope-batch-
+      correct`` first removes a technical location offset between the testing and
+      normative populations (robust median shift per (metric, age-bin); additive
+      for FA-like metrics, multiplicative for diffusivities) so a batch effect
+      does not masquerade as value outliers.  It does not touch the shape QC.
   (2) **shape / anatomy outlier** -- based on the ``--shape-metric`` (FA) profile
       only, since flat metrics carry little shape information: the Pearson
       correlation with the prior bin **mean** (or ``--corr-reference median``)
@@ -458,7 +462,70 @@ def fraction_inside(M: np.ndarray, lo: np.ndarray, hi: np.ndarray):
     return frac, n_valid.astype(int), n_inside.astype(int)
 
 
-def compute_profile_qc(inputs, prior_dir, bins, corr_reference, envelope_cfg, exclude_ids=None, exclude_full=None):
+def estimate_batch_shifts(inputs, prior_dir, bins, mult_metrics, exclude_ids=None, exclude_full=None):
+    """Robust batch shift of the testing population vs the normative reference.
+
+    For each (metric, age-bin), pools across tracts the per-profile **median**
+    residual to the normative centre (median/p50) and takes the median over
+    profiles -- additive (``value - ref``) for FA-like metrics, multiplicative
+    (``value / ref``) for diffusivities in *mult_metrics*.  Returns
+    ``{(metric, bin): (kind, value, n_profiles)}`` with kind in {"add", "mul"}.
+    This corrects a technical location offset between populations for the
+    envelope (value) QC only; the shape QC is shift/scale invariant.
+    """
+    from collections import defaultdict
+
+    per = defaultdict(list)
+    for csv_path in inputs:
+        tract = os.path.basename(os.path.dirname(csv_path))
+        metric = os.path.basename(csv_path)[: -len(".csv")].rsplit("_", 1)[1]
+        prior_path = find_prior_stats(prior_dir, tract, metric)
+        if prior_path is None:
+            continue
+        df = load_profile_table(csv_path, exclude_ids, exclude_full)
+        prior = pd.read_csv(prior_path, index_col=0).reindex(df.index)
+        col_ages = {c: age_of(c) for c in df.columns}
+        mult = metric in mult_metrics
+        for lo, hi, label in bins:
+            ref_key = f"{label}_p50" if f"{label}_p50" in prior.columns else f"{label}_mean"
+            if ref_key not in prior.columns:
+                continue
+            ref = prior[ref_key].to_numpy(dtype=float)[:, None]
+            cols = [c for c, a in col_ages.items() if a is not None and lo <= a <= hi]
+            if not cols:
+                continue
+            M = df[cols].to_numpy(dtype=float)
+            with np.errstate(invalid="ignore", divide="ignore"), warnings.catch_warnings():
+                warnings.simplefilter("ignore", category=RuntimeWarning)
+                if mult:
+                    resid = np.where(np.isfinite(M) & np.isfinite(ref) & (ref > 0), M / ref, np.nan)
+                else:
+                    resid = np.where(np.isfinite(M) & np.isfinite(ref), M - ref, np.nan)
+                prof_med = np.nanmedian(resid, axis=0)  # one robust residual per profile column
+            per[(metric, label)].extend(prof_med[np.isfinite(prof_med)].tolist())
+
+    shifts = {}
+    for (metric, label), vals in per.items():
+        arr = np.asarray(vals, dtype=float)
+        if arr.size == 0:
+            continue
+        kind = "mul" if metric in mult_metrics else "add"
+        shifts[(metric, label)] = (kind, float(np.median(arr)), int(arr.size))
+    return shifts
+
+
+def _apply_batch_shift(M, metric, label, batch_shifts):
+    """Bring testing values into the normative frame for the envelope check."""
+    if not batch_shifts or (metric, label) not in batch_shifts:
+        return M
+    kind, val, _ = batch_shifts[(metric, label)]
+    if kind == "mul":
+        return M / val if val not in (0.0,) else M
+    return M - val
+
+
+def compute_profile_qc(inputs, prior_dir, bins, corr_reference, envelope_cfg, exclude_ids=None,
+                       exclude_full=None, batch_shifts=None):
     """Per-profile QC vs the age-appropriate prior reference.
 
     Returns a long-form DataFrame: tract, metric, subject_session, age, bin,
@@ -491,9 +558,10 @@ def compute_profile_qc(inputs, prior_dir, bins, corr_reference, envelope_cfg, ex
             if not cols:
                 continue
             M = df[cols].to_numpy(dtype=float)
-            r = pearson_columns(M, ref_vec)
+            r = pearson_columns(M, ref_vec)  # shape: shift/scale invariant, uses raw M
             if env is not None:
-                frac, nval, nin = fraction_inside(M, env[0], env[1])
+                M_env = _apply_batch_shift(M, metric, label, batch_shifts)
+                frac, nval, nin = fraction_inside(M_env, env[0], env[1])
             else:
                 frac = np.full(len(cols), np.nan)
                 nval = np.zeros(len(cols), dtype=int)
@@ -678,6 +746,13 @@ def main(argv=None) -> int:
     p.add_argument("--value-min-inside", type=float, default=0.9,
                    help="A profile is a value outlier if the fraction of positions inside the envelope "
                         "is below this (default: 0.9)")
+    p.add_argument("--envelope-batch-correct", action="store_true",
+                   help="Correct a batch shift (testing vs normative) before the value/envelope QC: a robust "
+                        "median shift per (metric, age-bin), additive for FA-like metrics and multiplicative "
+                        "for diffusivities. Does NOT affect the shape/correlation QC")
+    p.add_argument("--batch-mult-metrics", default="md,rd,ad",
+                   help="Metrics corrected multiplicatively (others additively) under --envelope-batch-correct "
+                        "(default: md,rd,ad)")
     # (2) shape / anatomy outliers (correlation to reference profile)
     p.add_argument("--shape-outlier-method", default="threshold", choices=["threshold", "iqr"],
                    help="Flag shape outliers by a fixed correlation threshold, or a robust per-group "
@@ -770,8 +845,23 @@ def main(argv=None) -> int:
             log.info("Metrics excluded from outlier computation (decision still applied): %s",
                      sorted(exclude_metrics))
 
+        batch_shifts = None
+        if args.envelope_batch_correct:
+            mult_metrics = {m.strip() for m in args.batch_mult_metrics.split(",") if m.strip()}
+            batch_shifts = estimate_batch_shifts(inputs, args.prior_stats_dir, bins, mult_metrics,
+                                                 exclude_ids=reg_ss, exclude_full=full_excl)
+            log.info("Envelope batch correction (testing vs normative), robust median shift per (metric, bin):")
+            os.makedirs(plots_root, exist_ok=True)
+            brows = []
+            for (metric, label), (kind, val, n) in sorted(batch_shifts.items()):
+                desc = f"{val:+.4g}" if kind == "add" else f"×{val:.4g}"
+                log.info("  %-4s [%s]: %s %s (n=%d profiles)", metric, label, kind, desc, n)
+                brows.append({"metric": metric, "bin": label, "kind": kind, "shift": val, "n_profiles": n})
+            pd.DataFrame(brows).to_csv(os.path.join(plots_root, f"batch_shifts_{args.corr_reference}.csv"),
+                                       index=False)
+
         qc = compute_profile_qc(inputs, args.prior_stats_dir, bins, args.corr_reference, env_cfg,
-                                exclude_ids=reg_ss, exclude_full=full_excl)
+                                exclude_ids=reg_ss, exclude_full=full_excl, batch_shifts=batch_shifts)
         groups = detect_group_outliers(qc, args.value_min_inside, args.shape_outlier_method,
                                        args.corr_min, args.corr_iqr_k, args.shape_metric, exclude_metrics)
 
@@ -835,7 +925,8 @@ def main(argv=None) -> int:
             log.info("Wrote cleaned-data metric summaries (mean, median) under %s/", clean_root)
 
             # cleaned-data correlation QC: profile_qc CSV always, plots when enabled
-            qc_clean = compute_profile_qc(clean_tables, args.prior_stats_dir, bins, args.corr_reference, env_cfg)
+            qc_clean = compute_profile_qc(clean_tables, args.prior_stats_dir, bins, args.corr_reference, env_cfg,
+                                          batch_shifts=batch_shifts)
             os.makedirs(clean_root, exist_ok=True)
             clean_qc_csv = os.path.join(clean_root, f"profile_qc_{args.corr_reference}.csv")
             qc_clean.to_csv(clean_qc_csv, index=False)
