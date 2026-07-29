@@ -48,7 +48,7 @@ import pandas as pd
 
 log = logging.getLogger("impute")
 
-METRIC_ORDER = ["fa", "md", "rd", "ad", "NDI", "ODI", "FWF"]
+METRIC_ORDER = ["fa", "md", "rd", "ad", "NDI", "ODI", "FWF", "FW_FA", "FW_MD", "FW_RD", "FW_AD"]
 
 
 # ---------------------------------------------------------------------------
