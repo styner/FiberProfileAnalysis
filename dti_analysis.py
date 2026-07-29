@@ -16,7 +16,7 @@ Pipeline
 6.  If >=2 shells are present, fit NODDI with AMICO (using all shells) and
     write NDI / ODI / FWF (+ direction) maps to NIfTI.
 7.  If >=2 shells are present, fit free-water-corrected DTI (fwDTI, DIPY) using
-    all shells and write FW_FA / FW_MD / FW_RD / FW_AD / FW_f (+ tensor NRRD).
+    all shells and write FWFA / FWMD / FWRD / FWAD / FWf (+ tensor NRRD).
 
 Note
 ----
@@ -435,7 +435,7 @@ def compute_fwdti(dwi_path, bval_path, bvec_path, mask, affine, out_dir, prefix,
         vol = np.nan_to_num(vol, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
         if mask is not None:
             vol = vol * mask
-        dst = os.path.join(out_dir, f"{prefix}_FW_{key}.nii.gz")
+        dst = os.path.join(out_dir, f"{prefix}_FW{key}.nii.gz")
         nib.save(nib.Nifti1Image(vol, affine), dst)
         written.append(dst)
         log.info("      wrote %s", dst)
@@ -444,7 +444,7 @@ def compute_fwdti(dwi_path, bval_path, bvec_path, mask, affine, out_dir, prefix,
     quad = fit.quadratic_form.astype(np.float32)  # (X, Y, Z, 3, 3) tissue tensor
     if mask is not None:
         quad = quad * mask[..., None, None]
-    dst = os.path.join(out_dir, f"{prefix}_FW_tensor.nrrd")
+    dst = os.path.join(out_dir, f"{prefix}_FWtensor.nrrd")
     write_tensor_nrrd(dst, quad, affine)
     written.append(dst)
     log.info("      wrote %s", dst)
