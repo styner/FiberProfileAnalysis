@@ -439,7 +439,7 @@ def compute_fwdti(dwi_path, bval_path, bvec_path, mask, affine, out_dir, prefix,
         nib.save(nib.Nifti1Image(vol, affine), dst)
         written.append(dst)
         log.info("      wrote %s", dst)
-        log.debug("      FW_%s stats: %s", key, _img_stats(vol[vol != 0] if mask is not None else vol))
+        log.debug("      FW%s stats: %s", key, _img_stats(vol[vol != 0] if mask is not None else vol))
 
     quad = fit.quadratic_form.astype(np.float32)  # (X, Y, Z, 3, 3) tissue tensor
     if mask is not None:
