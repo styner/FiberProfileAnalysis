@@ -15,6 +15,18 @@ Metrics
 * Scalar maps (FA primary; MD/RD/AD optional) vs the atlas, within a brain mask:
   MAE, 3D-SSIM (+ map), NCC (zero-normalised cross-correlation).
 * Tensor principal-direction **angular error** (deg) vs the atlas, over WM.
+* **Contiguity of the disagreement** (``*BlobFrac`` / ``*BlobConc``): noise and
+  age mismatch scatter bad voxels; a failed warp produces a few *contiguous*
+  blobs.  Connected components of the extreme-voxel mask give the largest-blob
+  volume fraction and the share of extreme voxels sitting in the top-k blobs.
+  Three model-free/model-based cuts are reported: the subject's worst-SSIM
+  percentile (``--ssim-blob-pct``), angular error above ``--ang-blob-deg``, and,
+  where a normative model exists, |z| > ``--z-thresh``.
+* **CSF sanity check** (``CSF_*``): a deep, high-MD / low-FA reference region
+  (ventricles) is derived from the atlas.  A misregistration drops white matter
+  into the ventricles, so subject MD there collapses (``CSF_MDratio`` << 1) and
+  subject FA rises (``CSF_FAmean``).  Needs deformed MD maps; skip with
+  ``--no-csf-check``.
 
 Age handling
 ------------
@@ -36,7 +48,24 @@ comparison into a standardised deviation (z):
 Without a normative model, raw subject-vs-atlas scores are used (age-confounded).
 
 Outlier decision is **one combined flag per subject-session** (a bad warp hits
-all metrics/the tensor together).
+all metrics/the tensor together).  ``--combine`` picks the rule:
+
+* ``robust-z`` (default): mean of the per-metric robust z-scores, itself
+  robust-z'd and cut at ``--outlier-mad``.
+* ``mahalanobis``: robust (MCD, ``--mahal-support``) Mahalanobis distance over
+  the whole metric vector, cut at a chi-square quantile
+  (``--outlier-chi2-p``).  This accounts for the strong correlation between
+  MAE/SSIM/NCC on the same map -- which the plain mean triple-counts -- and does
+  not let one severe failure be averaged away by passing dimensions.  Only
+  *worse-than-typical* sessions are flagged.
+
+``mahalanobis_d`` / ``mahalanobis_p`` / ``mahal_top_contrib`` (the metric
+contributing most to the distance, i.e. *why* a session stands out) are written
+whenever the cohort is large enough (n >= 5x features), regardless of the rule
+in force, as are ``combined_score`` / ``combined_robust_z``.  Note that the
+Mahalanobis distances of a real cohort are usually far heavier-tailed than
+chi-square: the run log reports how many sessions the chi-square cut would flag,
+so check that number before switching the rule.
 
 Modes
 -----
@@ -44,7 +73,8 @@ Modes
   into ``--normative-dir`` and exit.
 * default (QC)          : score ``--data-dir`` subjects, write a table and outlier
   flags.  NIfTI disagreement maps + a per-subject preview PNG (atlas FA, DTI FA,
-  FA diff, FA SSIM, angular error z) are written **only for flagged outliers**;
+  FA diff, FA SSIM, angular error z, largest blobs) are written **only for
+  flagged outliers**;
   ``--save-all-maps`` writes them for every session.
 
 Usage
@@ -71,6 +101,7 @@ import sys
 import numpy as np
 import nibabel as nib
 import nrrd
+from scipy import ndimage, stats
 
 log = logging.getLogger("reg_qc")
 
@@ -269,6 +300,101 @@ def brain_mask(subj_fa, atlas_fa, thr):
 
 
 # ---------------------------------------------------------------------------
+# Contiguity of the disagreement (largest-blob metrics)
+# ---------------------------------------------------------------------------
+BLOB_STRUCT = ndimage.generate_binary_structure(3, 1)  # 6-connectivity
+
+
+def blob_stats(extreme, valid, top_k=3, min_blob=10):
+    """Connected-component summary of an extreme-voxel mask.
+
+    Registration failures put the bad voxels in a few *contiguous* clumps, while
+    noise and age mismatch scatter them; ``frac`` alone cannot tell these apart.
+
+    Returns ``(stats, blobs)`` where *stats* has
+
+    * ``frac``     : extreme voxels / valid voxels
+    * ``maxfrac``  : largest connected component / valid voxels
+    * ``conc``     : share of the extreme voxels living in the top-*k* blobs
+                     (NaN when there are too few extreme voxels to be meaningful)
+    * ``nblob``    : number of components of at least *min_blob* voxels
+
+    and *blobs* is the top-*k* component mask (uint8, for saving/preview).
+    """
+    nvalid = int(valid.sum())
+    empty = np.zeros(valid.shape, np.uint8)
+    if nvalid == 0:
+        return {"frac": np.nan, "maxfrac": np.nan, "conc": np.nan, "nblob": 0}, empty
+    ex = extreme & valid
+    n_ex = int(ex.sum())
+    if n_ex == 0:
+        return {"frac": 0.0, "maxfrac": 0.0, "conc": np.nan, "nblob": 0}, empty
+    lab, _ = ndimage.label(ex, structure=BLOB_STRUCT)
+    sizes = np.bincount(lab.ravel())
+    sizes[0] = 0
+    order = np.argsort(sizes)[::-1][:top_k]
+    keep = [int(i) for i in order if sizes[i] > 0]
+    stats = {
+        "frac": n_ex / nvalid,
+        "maxfrac": float(sizes[keep[0]]) / nvalid,
+        # concentration is meaningless on a handful of voxels
+        "conc": float(sizes[keep].sum()) / n_ex if n_ex >= min_blob else np.nan,
+        "nblob": int((sizes >= min_blob).sum()),
+    }
+    return stats, np.isin(lab, keep).astype(np.uint8)
+
+
+def add_blob_row(row, prefix, stats):
+    row[f"{prefix}BlobFrac"] = stats["maxfrac"]
+    row[f"{prefix}BlobConc"] = stats["conc"]
+    row[f"{prefix}BlobN"] = stats["nblob"]
+
+
+# ---------------------------------------------------------------------------
+# CSF / ventricle sanity check
+# ---------------------------------------------------------------------------
+def build_csf_roi(atlas_fa, atlas_md, mask_thr, md_pct=95.0, fa_max=0.15,
+                  erode=8, top_k=3, min_size=50):
+    """Deep high-MD / low-FA atlas region (~ventricles) for the CSF sanity check.
+
+    No atlas parcellation is assumed: the ROI is the top ``md_pct`` percentile of
+    atlas MD with atlas FA < *fa_max*, restricted to the interior of the brain
+    (mask eroded by *erode* voxels) so sulcal CSF and partial-volume boundary
+    voxels are excluded, keeping the *top_k* largest components.
+
+    The threshold is a percentile, so the ROI is independent of the MD units.
+    """
+    brain = ndimage.binary_fill_holes(atlas_fa > mask_thr)
+    if not brain.any():
+        return np.zeros(atlas_fa.shape, bool)
+    inner = ndimage.binary_erosion(brain, BLOB_STRUCT, int(erode))
+    roi = (atlas_md > np.percentile(atlas_md[brain], md_pct)) & (atlas_fa < fa_max) & inner
+    roi = ndimage.binary_opening(roi, BLOB_STRUCT, 1)
+    lab, _ = ndimage.label(roi, structure=BLOB_STRUCT)
+    sizes = np.bincount(lab.ravel())
+    sizes[0] = 0
+    keep = [int(i) for i in np.argsort(sizes)[::-1][:top_k] if sizes[i] >= min_size]
+    return np.isin(lab, keep) if keep else np.zeros(atlas_fa.shape, bool)
+
+
+def csf_metrics(subj_fa, subj_md, atlas_md, roi):
+    """MD ratio and FA in the ventricle ROI.
+
+    A warp that drags white matter into the ventricles collapses MD there
+    (``MDratio`` well below 1) and raises FA (``FAmean`` well above the ~0.05 of
+    real CSF), independently of how well the maps agree elsewhere.
+    """
+    out = {"CSF_MDratio": np.nan, "CSF_FAmean": np.nan}
+    if roi is None or not roi.any():
+        return out
+    a = float(np.mean(atlas_md[roi]))
+    if subj_md is not None and abs(a) > 1e-12:
+        out["CSF_MDratio"] = float(np.mean(subj_md[roi])) / a
+    out["CSF_FAmean"] = float(np.mean(subj_fa[roi]))
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Normative model
 # ---------------------------------------------------------------------------
 def build_normative(sessions, atlas_scalars, atlas_fa, bins, scalar_metrics, do_angular,
@@ -367,6 +493,48 @@ def load_normative_scalar(normative_dir, label, metric):
     return mean, std
 
 
+def check_normative_frame(normative_dir, bins, atlas_pd, atlas_fa, angular_fa_min, flip_name,
+                          max_deg=30.0):
+    """Verify the normative angular model lives in the atlas tensor frame.
+
+    A model accumulated under a different axis reflection than the QC applies
+    would silently corrupt every ``ANG_*Z``.  The manifest records the flip that
+    was *requested* at build time, which can be stale or simply wrong, so check
+    the model itself: ``angular_mu`` and the atlas principal directions describe
+    the same anatomy, and must agree to within a few degrees over core WM.
+    """
+    core = atlas_fa > max(angular_fa_min, 0.3)
+    meds = {}
+    for _, _, label in bins:
+        na = load_normative_angular(normative_dir, label)
+        if na is None:
+            continue
+        mu, _ = na
+        v = core & (np.linalg.norm(mu, axis=-1) > 0)
+        if v.sum() < 1000:
+            continue
+        dot = np.clip(np.abs(np.sum(mu[v] * atlas_pd[v], axis=-1)), 0, 1)
+        meds[label] = float(np.median(np.degrees(np.arccos(dot))))
+    if not meds:
+        return
+    worst = max(meds.values())
+    try:
+        with open(os.path.join(normative_dir, "manifest.json")) as fh:
+            nf = json.load(fh).get("tensor_flip", "none")
+    except OSError:
+        nf = None
+    if worst > max_deg:
+        log.warning("normative angular frame disagrees with the atlas (median mu-vs-atlas "
+                    "angle %s); rebuild it with --tensor-flip %s or the ANG_*Z are meaningless",
+                    ", ".join(f"{k} {v:.0f}deg" for k, v in meds.items()), flip_name)
+    else:
+        log.info("normative angular frame matches the atlas (median mu-vs-atlas angle %s)",
+                 ", ".join(f"{k} {v:.0f}deg" for k, v in meds.items()))
+        if nf is not None and nf != flip_name:
+            log.info("  (manifest says tensor_flip='%s' and QC detected '%s', but the stored "
+                     "directions are consistent -- the manifest label is stale)", nf, flip_name)
+
+
 def load_normative_angular(normative_dir, label):
     d = os.path.join(normative_dir, label)
     if not os.path.isfile(os.path.join(d, "angular_mu.nii.gz")):
@@ -380,7 +548,8 @@ def load_normative_angular(normative_dir, label):
 # QC
 # ---------------------------------------------------------------------------
 def make_preview(sid, atlas_fa, subj_fa, maps, out_dir):
-    """One PNG per subject: atlas FA, DTI FA, FA diff, FA SSIM, angular error z."""
+    """One PNG per subject: atlas FA, DTI FA, FA diff, FA SSIM, angular error z,
+    and the largest contiguous disagreement blobs over the subject FA."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -397,12 +566,20 @@ def make_preview(sid, atlas_fa, subj_fa, maps, out_dir):
         panels.append(("Angular error z", sl(maps["angular_z"]), "inferno", (0, 3)))
     elif "angular_deg" in maps:
         panels.append(("Angular error (deg)", sl(maps["angular_deg"]), "hot", (0, 60)))
+    blob_key = next((k for k in ("FA_z_blobs", "FA_ssim_blobs", "angular_z_blobs",
+                                 "angular_deg_blobs") if k in maps), None)
+    if blob_key is not None:
+        panels.append((f"Largest blobs ({blob_key[:-6]})", sl(maps[blob_key]), None, (0, 1)))
 
     fig, axes = plt.subplots(1, len(panels), figsize=(4 * len(panels), 4.6))
     for ax, (title, img, cm, (vlo, vhi)) in zip(np.atleast_1d(axes), panels):
-        im = ax.imshow(img, cmap=cm, vmin=vlo, vmax=vhi)
+        if cm is None:  # blob overlay on the subject FA
+            ax.imshow(sl(subj_fa), cmap="gray", vmin=0, vmax=1)
+            ax.imshow(np.ma.masked_where(img == 0, img), cmap="autumn", vmin=0, vmax=1, alpha=0.65)
+        else:
+            im = ax.imshow(img, cmap=cm, vmin=vlo, vmax=vhi)
+            fig.colorbar(im, ax=ax, fraction=0.046, pad=0.02)
         ax.set_title(title, fontsize=11); ax.axis("off")
-        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.02)
     fig.suptitle(f"Registration QC — {sid} (axial z={k})", fontsize=13)
     fig.tight_layout()
     prev_dir = os.path.join(out_dir, "previews")
@@ -417,7 +594,8 @@ def qc_subject(s, atlas, bins, normative_dir, cfg, out_dir=None):
     When *out_dir* is given, also save the NIfTI disagreement maps and a preview
     PNG (used only for the subjects we choose to write out).
     """
-    atlas_scalars, atlas_fa, atlas_pd, atlas_wm, ref_affine = atlas
+    atlas_scalars, atlas_fa = atlas["scalars"], atlas["fa"]
+    atlas_pd, atlas_wm, ref_affine = atlas["pd"], atlas["wm"], atlas["affine"]
     sfa, _ = load_scalar(s["scalars"]["FA"])
     mask = brain_mask(sfa, atlas_fa, cfg["mask_thr"])
     label = bin_label_for_age(s["age"], bins)
@@ -437,8 +615,16 @@ def qc_subject(s, atlas, bins, normative_dir, cfg, out_dir=None):
         ssim_mean, ssim_map = masked_ssim(v, atlas_scalars[m], mask, dr)
         row[f"{m}_SSIM"] = ssim_mean
 
+        # contiguity of the locally-dissimilar voxels (model-free, always available).
+        # The cut is the subject's own worst-SSIM percentile: an absolute SSIM floor
+        # saturates (every session merges into one brain-sized blob), whereas fixing
+        # the *number* of extreme voxels isolates how clustered they are.
+        ssim_cut = float(np.percentile(ssim_map[mask], cfg["ssim_blob_pct"])) if mask.any() else 0.0
+        st, ssim_blobs = blob_stats(ssim_map < ssim_cut, mask, cfg["blob_top_k"])
+        add_blob_row(row, f"{m}_ssim", st)
+
         znorm = load_normative_scalar(normative_dir, label, m) if normative_dir else None
-        z = None
+        z, z_blobs = None, None
         if znorm is not None:
             mean, std = znorm
             valid = mask & np.isfinite(mean) & np.isfinite(std) & (std > 0)
@@ -446,13 +632,17 @@ def qc_subject(s, atlas, bins, normative_dir, cfg, out_dir=None):
             z[valid] = (v[valid] - mean[valid]) / std[valid]
             row[f"{m}_meanAbsZ"] = float(np.mean(np.abs(z[valid]))) if valid.any() else np.nan
             row[f"{m}_fracZgt"] = float(np.mean(np.abs(z[valid]) > cfg["z_thresh"])) if valid.any() else np.nan
+            st, z_blobs = blob_stats(np.abs(z) > cfg["z_thresh"], valid, cfg["blob_top_k"])
+            add_blob_row(row, f"{m}_z", st)
         if save_maps and m == "FA":
             diff = np.zeros(mask.shape, np.float32); diff[mask] = v[mask] - atlas_scalars[m][mask]
             smap = np.zeros(mask.shape, np.float32); smap[mask] = ssim_map[mask]
             maps["FA_diff"] = diff
             maps["FA_ssim"] = smap
+            maps["FA_ssim_blobs"] = ssim_blobs
             if z is not None:
                 maps["FA_z"] = z
+                maps["FA_z_blobs"] = z_blobs
 
     # --- angular ---
     if cfg["do_angular"] and s["tensor"] is not None and atlas_pd is not None:
@@ -460,8 +650,11 @@ def qc_subject(s, atlas, bins, normative_dir, cfg, out_dir=None):
         pd = principal_directions(s["tensor"], wm, cfg["flip"])
         ang = angular_error_deg(pd, atlas_pd, wm)
         row["ANG_meanDeg"] = float(np.mean(ang[wm])) if wm.any() else np.nan
+        st, ang_blobs = blob_stats(ang > cfg["ang_blob_deg"], wm, cfg["blob_top_k"])
+        add_blob_row(row, "ANG_deg", st)
         if save_maps:
             maps["angular_deg"] = ang
+            maps["angular_deg_blobs"] = ang_blobs
 
         na = load_normative_angular(normative_dir, label) if normative_dir else None
         if na is not None:
@@ -475,8 +668,16 @@ def qc_subject(s, atlas, bins, normative_dir, cfg, out_dir=None):
                 zang[valid] = sin_d / np.maximum(sigma[valid], cfg["angular_sigma_floor"])
             row["ANG_meanZ"] = float(np.mean(zang[valid])) if valid.any() else np.nan
             row["ANG_fracZgt"] = float(np.mean(zang[valid] > cfg["z_thresh"])) if valid.any() else np.nan
+            st, zang_blobs = blob_stats(zang > cfg["z_thresh"], valid, cfg["blob_top_k"])
+            add_blob_row(row, "ANG_z", st)
             if save_maps:
                 maps["angular_z"] = zang
+                maps["angular_z_blobs"] = zang_blobs
+
+    # --- CSF / ventricle sanity check ---
+    if atlas.get("csf_roi") is not None:
+        smd = load_scalar(s["scalars"]["MD"])[0] if "MD" in s["scalars"] else None
+        row.update(csf_metrics(sfa, smd, atlas["md"], atlas["csf_roi"]))
 
     # --- write maps + preview ---
     if save_maps and maps:
@@ -499,6 +700,127 @@ def robust_z(x):
     return (x - med) / scale
 
 
+# ---------------------------------------------------------------------------
+# Combined score
+# ---------------------------------------------------------------------------
+def worseness_features(df, scalar_metrics, do_angular):
+    """(X, names): the metric vector per session, oriented so higher = worse.
+
+    Left out on purpose: ``*BlobConc`` / ``*BlobN`` (concentration is NaN when
+    few voxels are extreme, and the count is not a severity), and
+    ``*ssimBlobFrac``, whose cut is a per-subject percentile -- it measures how
+    *clustered* the worst voxels are, which is not monotone in badness (a
+    globally bad warp spreads its worst 5% out again).  Both stay in the table
+    as diagnostics.
+    """
+    cols, names = [], []
+
+    def take(name, values):
+        v = np.asarray(values, dtype=float)
+        if np.isfinite(v).sum() >= max(3, 0.5 * len(v)):
+            cols.append(v)
+            names.append(name)
+
+    for m in scalar_metrics:
+        if f"{m}_MAE" in df:
+            take(f"{m}_MAE", df[f"{m}_MAE"])
+            take(f"{m}_1-SSIM", 1.0 - df[f"{m}_SSIM"])
+            take(f"{m}_1-NCC", 1.0 - df[f"{m}_NCC"])
+        for c in (f"{m}_meanAbsZ", f"{m}_fracZgt", f"{m}_zBlobFrac"):
+            if c in df:
+                take(c, df[c])
+    if do_angular:
+        for c in ("ANG_meanDeg", "ANG_meanZ", "ANG_fracZgt", "ANG_degBlobFrac", "ANG_zBlobFrac"):
+            if c in df:
+                take(c, df[c])
+    if "CSF_MDratio" in df:
+        take("CSF_1-MDratio", 1.0 - df["CSF_MDratio"])
+    if "CSF_FAmean" in df:
+        take("CSF_FAmean", df["CSF_FAmean"])
+    if not cols:
+        return np.zeros((len(df), 0)), []
+    return np.column_stack(cols), names
+
+
+def robust_mahalanobis(X, names, support=0.85, min_ratio=5.0, corr_max=0.995):
+    """Robust (MCD) Mahalanobis distance over the metric vector.
+
+    The metrics are heavily correlated (MAE/SSIM/NCC on the same map measure
+    nearly the same thing), which a plain mean triple-counts; the Mahalanobis
+    distance whitens that away and lets a single severe failure stand out
+    instead of being averaged down.  The centre and covariance come from the
+    cleanest *support* fraction of the cohort (Minimum Covariance Determinant),
+    so the failures themselves cannot inflate the reference spread.
+
+    Voxel-*fraction* features (``*fracZgt``, ``*BlobFrac``) sit near zero and
+    span orders of magnitude; they are put on a log scale first, otherwise their
+    tiny MAD makes them dominate the distance.
+
+    Returns None when the cohort is too small (n < *min_ratio* x features),
+    otherwise ``(d, contrib_names, bad_side, used_names)`` where *d* is the
+    distance, *contrib_names* names the largest contributor to d^2 per session,
+    and *bad_side* is True where the session deviates towards *worse* metrics.
+    """
+    n = X.shape[0]
+    if X.shape[1] == 0 or n < 4:
+        return None
+
+    # robust standardisation (conditioning only; Mahalanobis is scale-invariant)
+    Z, keep = [], []
+    for j, name in enumerate(names):
+        col = X[:, j].astype(float)
+        col = np.where(np.isfinite(col), col, np.nanmedian(col))  # median-impute
+        if "frac" in name.lower():  # voxel fractions -> log scale
+            pos = col[col > 0]
+            col = np.log10(col + (pos.min() / 2 if pos.size else 1e-9))
+        med = np.median(col)
+        scale = 1.4826 * np.median(np.abs(col - med))
+        if not np.isfinite(scale) or scale < 1e-12:
+            log.debug("mahalanobis: dropping degenerate feature %s", name)
+            continue
+        Z.append((col - med) / scale)
+        keep.append(name)
+    if not Z:
+        return None
+    Z = np.column_stack(Z)
+
+    # drop near-duplicate features so the covariance stays invertible
+    sel = []
+    for j in range(Z.shape[1]):
+        if all(abs(np.corrcoef(Z[:, j], Z[:, k])[0, 1]) <= corr_max for k in sel):
+            sel.append(j)
+        else:
+            log.debug("mahalanobis: dropping collinear feature %s", keep[j])
+    Z, used = Z[:, sel], [keep[j] for j in sel]
+
+    p = Z.shape[1]
+    if n < min_ratio * p:
+        log.warning("mahalanobis needs n >= %.0f x features (%d < %.0f x %d)",
+                    min_ratio, n, min_ratio, p)
+        return None
+
+    try:
+        from sklearn.covariance import MinCovDet
+        fit = MinCovDet(support_fraction=support, random_state=0).fit(Z)
+        loc, cov = fit.location_, fit.covariance_
+    except Exception as exc:  # sklearn missing, or MCD failed to converge
+        log.warning("MCD unavailable/failed (%s); using the central %.0f%% for the covariance",
+                    exc, 100 * support)
+        d0 = np.linalg.norm(Z - np.median(Z, axis=0), axis=1)
+        core = Z[d0 <= np.percentile(d0, 100 * support)]
+        loc, cov = np.median(core, axis=0), np.cov(core, rowvar=False)
+        cov = np.atleast_2d(cov)
+    cov = cov + np.eye(p) * (1e-6 * max(np.trace(cov) / p, 1e-12))  # ridge
+    inv = np.linalg.pinv(cov)
+
+    dev = Z - loc
+    # per-feature contributions sum exactly to d^2 (order-independent)
+    contrib = dev * (dev @ inv)
+    d2 = np.clip(contrib.sum(axis=1), 0.0, None)
+    top = [used[j] for j in np.argmax(contrib, axis=1)]
+    return np.sqrt(d2), top, dev.mean(axis=1) > 0, used
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--data-dir", default="RegistrationData", help="Root with sub-*/ses-*/AtlasReg + Atlas/")
@@ -517,6 +839,24 @@ def main(argv=None) -> int:
     p.add_argument("--angular-sigma-floor", type=float, default=0.035, help="Floor on angular dispersion (~sin 2°)")
     p.add_argument("--min-count", type=int, default=2, help="Min reference subjects per voxel for a valid normative")
     p.add_argument("--z-thresh", type=float, default=3.0, help="|z| threshold for extreme-voxel fractions (default: 3)")
+    p.add_argument("--ssim-blob-pct", type=float, default=5.0,
+                   help="Worst-SSIM percentile defining a dissimilar voxel for the blob metrics (default: 5)")
+    p.add_argument("--ang-blob-deg", type=float, default=40.0,
+                   help="Angular-error floor (deg) defining a bad voxel for the blob metrics (default: 40)")
+    p.add_argument("--blob-top-k", type=int, default=3, help="Blobs summed for the concentration metric (default: 3)")
+    p.add_argument("--no-csf-check", action="store_true", help="Skip the CSF/ventricle sanity check")
+    p.add_argument("--csf-md-pct", type=float, default=95.0,
+                   help="Atlas-MD percentile defining the CSF ROI (default: 95)")
+    p.add_argument("--csf-fa-max", type=float, default=0.15, help="Atlas-FA ceiling for the CSF ROI (default: 0.15)")
+    p.add_argument("--csf-erode", type=int, default=8,
+                   help="Brain-mask erosion (voxels) keeping the CSF ROI deep (default: 8)")
+    p.add_argument("--combine", default="robust-z", choices=["robust-z", "mahalanobis"],
+                   help="Rule turning the metrics into the outlier flag (default: robust-z). The "
+                        "Mahalanobis score is written to the table either way.")
+    p.add_argument("--outlier-chi2-p", type=float, default=1e-3,
+                   help="Chi-square tail probability for the Mahalanobis cutoff (default: 1e-3)")
+    p.add_argument("--mahal-support", type=float, default=0.85,
+                   help="Fraction of the cohort the MCD covariance is estimated from (default: 0.85)")
     p.add_argument("--outlier-mad", type=float, default=3.5, help="Robust-z cutoff on the combined score (default: 3.5)")
     p.add_argument("--save-all-maps", action="store_true",
                    help="Write disagreement maps + previews for every session (default: only flagged outliers)")
@@ -565,29 +905,52 @@ def main(argv=None) -> int:
         return 0
 
     # --- QC mode ---
-    normative_dir = args.normative_dir if (args.normative_dir and
-                                           os.path.isfile(os.path.join(args.normative_dir, "manifest.json"))) else None
+    os.makedirs(args.out_dir, exist_ok=True)
+    # an atlas folder may ship its own model (<atlas-dir>/normativeModel/)
+    cand = args.normative_dir or os.path.join(atlas_dir, "normativeModel")
+    normative_dir = cand if os.path.isfile(os.path.join(cand, "manifest.json")) else None
+    if normative_dir and not args.normative_dir:
+        log.info("using the normative model shipped with the atlas: %s", normative_dir)
     log.info("Metrics: scalars=%s angular=%s | normative=%s",
              scalar_metrics, do_angular, normative_dir or "(none -> raw, age-confounded)")
 
     atlas_scalars = {m: load_scalar(atlas_scalar_paths[m])[0] for m in scalar_metrics}
     ref_affine = nib.load(atlas_scalar_paths["FA"]).affine
-    atlas = (atlas_scalars, atlas_fa, atlas_pd, atlas_wm, ref_affine)
+    atlas = {"scalars": atlas_scalars, "fa": atlas_fa, "pd": atlas_pd, "wm": atlas_wm,
+             "affine": ref_affine, "md": None, "csf_roi": None}
+
+    # CSF / ventricle ROI (needs the atlas MD map, which may not be a --scalar-metric)
+    if not args.no_csf_check:
+        if "MD" not in atlas_scalar_paths:
+            log.warning("no atlas MD map in %s; skipping the CSF sanity check", atlas_dir)
+        else:
+            atlas["md"] = atlas_scalars.get("MD")
+            if atlas["md"] is None:
+                atlas["md"], _ = load_scalar(atlas_scalar_paths["MD"])
+            roi = build_csf_roi(atlas_fa, atlas["md"], args.mask_threshold, args.csf_md_pct,
+                                args.csf_fa_max, args.csf_erode, top_k=3)
+            if not roi.any():
+                log.warning("CSF ROI came out empty; skipping the CSF sanity check")
+            else:
+                atlas["csf_roi"] = roi
+                nib.save(nib.Nifti1Image(roi.astype(np.uint8), ref_affine),
+                         os.path.join(args.out_dir, "csf_roi.nii.gz"))
+                log.info("CSF ROI: %d voxels (atlas FA %.3f, MD %.3g) -> %s/csf_roi.nii.gz",
+                         int(roi.sum()), float(atlas_fa[roi].mean()), float(atlas["md"][roi].mean()),
+                         args.out_dir)
 
     sessions = find_sessions(args.data_dir)
     flip_name, flip = resolve_flip(sessions)
-    if normative_dir:
-        with open(os.path.join(normative_dir, "manifest.json")) as fh:
-            nf = json.load(fh).get("tensor_flip", "none")
-        if nf != flip_name:
-            log.warning("normative was built with tensor_flip='%s' but QC uses '%s'", nf, flip_name)
+    if normative_dir and do_angular and atlas_pd is not None:
+        check_normative_frame(normative_dir, bins, atlas_pd, atlas_fa, args.angular_fa_min, flip_name)
 
     cfg = {"scalar_metrics": scalar_metrics, "do_angular": do_angular, "mask_thr": args.mask_threshold,
            "angular_fa_min": args.angular_fa_min, "angular_sigma_floor": args.angular_sigma_floor,
-           "z_thresh": args.z_thresh, "flip": flip}
+           "z_thresh": args.z_thresh, "flip": flip,
+           "ssim_blob_pct": args.ssim_blob_pct, "ang_blob_deg": args.ang_blob_deg,
+           "blob_top_k": args.blob_top_k}
 
     log.info("QC on %d sessions", len(sessions))
-    os.makedirs(args.out_dir, exist_ok=True)
 
     save_all = args.save_all_maps
     rows, scored = [], []
@@ -621,15 +984,49 @@ def main(argv=None) -> int:
         df["combined_score"] = np.mean(np.vstack(parts), axis=0) if parts else np.nan
 
     df["combined_robust_z"] = robust_z(df["combined_score"].to_numpy())
-    df["is_outlier"] = df["combined_robust_z"] > args.outlier_mad
+
+    # --- Mahalanobis: always scored, flags only when it is the selected rule ---
+    X, names = worseness_features(df, scalar_metrics, do_angular)
+    mah = robust_mahalanobis(X, names, support=args.mahal_support)
+    mahal_flag = None
+    if mah is not None:
+        d, top, bad_side, used = mah
+        mcut = float(np.sqrt(stats.chi2.ppf(1.0 - args.outlier_chi2_p, len(used))))
+        df["mahalanobis_d"] = d
+        df["mahalanobis_p"] = stats.chi2.sf(d ** 2, len(used))
+        df["mahal_top_contrib"] = top
+        # one-sided: only sessions deviating towards *worse* metrics are failures
+        mahal_flag = (d > mcut) & bad_side
+        log.info("Mahalanobis on %d features (%s), MCD support %.0f%%: d > %.2f "
+                 "(chi2 p=%g) would flag %d/%d",
+                 len(used), ", ".join(used), 100 * args.mahal_support, mcut,
+                 args.outlier_chi2_p, int(mahal_flag.sum()), len(df))
+        if mahal_flag.mean() > 0.10:
+            log.warning("  that is %.0f%% of the cohort: the metric tail is heavier than chi-square "
+                        "predicts, so tighten --outlier-chi2-p before using --combine mahalanobis",
+                        100 * mahal_flag.mean())
+    elif args.combine == "mahalanobis":
+        log.warning("Mahalanobis not usable on this cohort; falling back to the robust-z rule")
+
+    if args.combine == "mahalanobis" and mahal_flag is not None:
+        rule, cutoff = "mahalanobis", mcut
+        df["is_outlier"] = mahal_flag
+    else:
+        rule, cutoff = "robust-z", args.outlier_mad
+        df["is_outlier"] = df["combined_robust_z"] > args.outlier_mad
+    df["outlier_rule"] = rule
 
     csv = os.path.join(args.out_dir, "registration_qc.csv")
     df.to_csv(csv, index=False)
     n_out = int(df["is_outlier"].sum())
-    log.info("Wrote %s | %d/%d sessions flagged (combined robust-z > %.1f)",
-             csv, n_out, len(df), args.outlier_mad)
+    log.info("Wrote %s | %d/%d sessions flagged (%s > %.2f)",
+             csv, n_out, len(df), "Mahalanobis d" if rule == "mahalanobis" else "combined robust-z",
+             cutoff)
     if n_out:
-        log.info("Outliers: %s", ", ".join(df.loc[df["is_outlier"], "id"]))
+        out = df.loc[df["is_outlier"]]
+        log.info("Outliers: %s", ", ".join(
+            f"{r.id} ({r.mahal_top_contrib})" for r in out.itertuples()
+        ) if rule == "mahalanobis" else ", ".join(out["id"]))
 
     # --- maps + previews: flagged only (default) or all (already done above) ---
     if save_all:
