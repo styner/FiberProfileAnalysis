@@ -1,0 +1,27 @@
+# Python package requirements for the FiberAnalysis scripts.
+#   pip install -r requirements.txt
+# Python >= 3.9 recommended. Versions are the minimums this code was validated
+# against; newer releases are generally fine.
+
+# --- core numerics / IO (used almost everywhere) ---
+numpy>=2.0
+pandas>=2.0
+nibabel>=5.0          # NIfTI read/write
+pynrrd>=1.0           # NRRD read/write (imported as `nrrd`)
+scipy>=1.11           # ndimage mask cleanup (via dipy and directly)
+
+# --- diffusion modelling: dti_analysis.py, registration_QC.py ---
+dipy>=1.12            # DTI / free-water DTI fits, SynthSeg, gradient tables
+SimpleITK>=2.3        # N4 bias-field correction (mask-input preprocessing)
+threadpoolctl>=3.0    # BLAS/OpenMP thread capping around the fits
+dmri-amico>=2.1       # NODDI fitting (imported as `amico`)
+
+# --- deep learning: SynthSeg masking (dti_analysis), SIREN imputation (impute_profiles) ---
+torch>=2.1
+
+# --- plotting / image similarity: profile_stat_QC.py, registration_QC.py ---
+matplotlib>=3.7
+scikit-image>=0.22    # 3D SSIM for registration QC (imported as `skimage`)
+
+# --- External (NOT pip-installable) system dependencies ---
+# FreeSurfer's `mri_synthstrip` on PATH  -> optional --mask-method synthstrip (dti_analysis.py)
