@@ -8,7 +8,8 @@ files of the standard metrics and:
 
   * removes an FVP with fewer than ``--min-lines`` lines (too short);
   * for non-FWF metrics, removes an FVP whose profile is essentially all zero
-    (fewer than ``--min-lines`` non ``,0,0,0,0`` lines);
+    (fewer than ``--min-lines`` non ``,0,0,0,0`` lines) -- disable with
+    ``--no-zero-check``;
   * reports (but does NOT remove) FVPs that contain ``nan`` -- these are left
     for later imputation.
 
@@ -16,7 +17,8 @@ Actions are appended to ``<proc_dir>/check_Fibers_<YYYY-MM-DD>.txt``.
 
 Usage
 -----
-    python CheckProfile_Cohort.py <base_dir> <proc_dir> [--atlas-dir DIR] [--dry-run]
+    python CheckProfile_Cohort.py <base_dir> <proc_dir> [--atlas-dir DIR]
+                                  [--no-zero-check] [--dry-run]
 
 ``<base_dir>`` holds ``sub*/ses*/Profiles/*.fvp``; ``<proc_dir>`` receives the
 report.  Removal is real by default (as in the original); use ``--dry-run`` to
@@ -55,6 +57,8 @@ def main(argv=None) -> int:
     p.add_argument("--atlas-dir", default=DEFAULT_ATLAS_DIR,
                    help="Folder of atlas fiber *.vtk defining the tract list")
     p.add_argument("--min-lines", type=int, default=10, help="Minimum FVP line count to keep (default: 10)")
+    p.add_argument("--no-zero-check", dest="zero_check", action="store_false",
+                   help="Skip the all-zero profile check (only the line-count and nan checks are done)")
     p.add_argument("--dry-run", action="store_true", help="Only log what would be removed; delete nothing")
     args = p.parse_args(argv)
 
@@ -104,7 +108,7 @@ def main(argv=None) -> int:
                     continue
 
                 # (2) all-zero profile (non-FWF metrics only)
-                if "_FWF" not in base:
+                if args.zero_check and "_FWF" not in base:
                     n_zero = sum(1 for ln in lines if ",0,0,0,0" in ln)
                     n_nonzero = total - n_zero
                     if n_nonzero < args.min_lines:
