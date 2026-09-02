@@ -27,9 +27,14 @@ across all metric tables of a tract: if an identifier has, say, ``fa`` but not
 ``NDI``, its column still appears in the ``NDI`` table, left blank.  Cells are
 the metric value; genuinely missing values (e.g. source ``-nan``) are blank.
 
+By default every metric found in the FVP tree is gathered; ``--metrics`` limits
+the run to a given list (names are the final filename token, e.g. ``fa``,
+``md``, ``NDI``, ``FWF``; matching is case-insensitive).
+
 Usage
 -----
     python gather_profiles.py --profiles-dir Output_Profiles --out-dir Profiles_CSV
+    python gather_profiles.py --metrics fa md NDI
 """
 
 from __future__ import annotations
@@ -143,6 +148,12 @@ def main(argv=None) -> int:
         default="Parameter_Value",
         help="FVP column to tabulate (default: Parameter_Value)",
     )
+    p.add_argument(
+        "--metrics",
+        nargs="+",
+        metavar="METRIC",
+        help="Only gather these metrics (e.g. fa md NDI); default: every metric found",
+    )
     p.add_argument("--arc-precision", type=int, default=4, help="Decimals for arc-length column alignment")
     p.add_argument("-v", "--verbose", action="store_true", help="Verbose logging")
     args = p.parse_args(argv)
@@ -155,6 +166,10 @@ def main(argv=None) -> int:
 
     if not os.path.isdir(args.profiles_dir):
         p.error(f"profiles dir not found: {args.profiles_dir}")
+
+    wanted_metrics = {m.lower() for m in args.metrics} if args.metrics else None
+    if wanted_metrics:
+        log.info("Restricting to metrics: %s", ", ".join(sorted(wanted_metrics)))
 
     tracts = load_tract_vocabulary(args.fibers_dir)
     log.info("Tract vocabulary: %d names from %s", len(tracts), args.fibers_dir)
@@ -169,7 +184,7 @@ def main(argv=None) -> int:
     # acquisitions in one session become separate columns).
     groups: dict = defaultdict(dict)
     tract_idents: dict = defaultdict(set)  # tract -> all identifiers seen (any metric)
-    n_ok = n_skip = 0
+    n_ok = n_skip = n_filtered = 0
     for f in files:
         parsed = parse_fvp_name(f, tracts)
         if parsed is None:
@@ -177,6 +192,9 @@ def main(argv=None) -> int:
             n_skip += 1
             continue
         subject, session, prefix, tract, metric = parsed
+        if wanted_metrics is not None and metric.lower() not in wanted_metrics:
+            n_filtered += 1
+            continue
         profile = read_fvp_profile(f, args.value_column, args.arc_precision)
         if profile is None:
             n_skip += 1
@@ -190,9 +208,13 @@ def main(argv=None) -> int:
 
     all_idents = sorted(set().union(*tract_idents.values())) if tract_idents else []
     log.info(
-        "Parsed %d profiles (%d skipped); %d identifiers, %d (tract,metric) tables",
-        n_ok, n_skip, len(all_idents), len(groups),
+        "Parsed %d profiles (%d skipped%s); %d identifiers, %d (tract,metric) tables",
+        n_ok, n_skip,
+        f", {n_filtered} not in --metrics" if wanted_metrics is not None else "",
+        len(all_idents), len(groups),
     )
+    if wanted_metrics is not None and not groups and files:
+        log.warning("no FVP files matched the requested metrics")
 
     os.makedirs(args.out_dir, exist_ok=True)
     n_written = 0
