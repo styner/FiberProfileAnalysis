@@ -20,6 +20,13 @@ One CSV per (tract, metric), grouped into a folder per tract::
 
     <out>/<tract>/<tract>_<metric>.csv
 
+All FVP files of a tract must share one arc-length grid: the first file read
+for a tract is the template, and any later file of that tract is reported and
+excluded if its sample count differs (exact match required) or an arc length
+deviates from the template by more than ``--arc-tolerance`` percent of the
+template's total tract length (default 0.1%).  Grids that pass within tolerance
+are snapped onto the template's arc-length values so the CSV rows stay aligned.
+
 Rows are the arc-length sample positions; columns are one per
 ``<subject>_<session>_<prefix>`` identifier (so multiple acquisitions/prefixes
 in the same session each get their own column).  The column set is shared
@@ -141,6 +148,22 @@ def read_fvp_profile(path: str, value_col: str, arc_precision: int = 4):
     return profile or None
 
 
+def compare_arc_grid(arcs, template, tol):
+    """Compare an arc-length grid against the tract template.
+
+    The sample count must match exactly; arc lengths may deviate by up to *tol*
+    (an absolute length, derived from the template's total length).  Returns
+    ``None`` when the grid is acceptable, else a short reason string.
+    """
+    if len(arcs) != len(template):
+        return f"{len(arcs)} samples vs {len(template)} in the template"
+    worst = max(range(len(arcs)), key=lambda i: abs(arcs[i] - template[i]), default=None)
+    if worst is None or abs(arcs[worst] - template[worst]) <= tol:
+        return None
+    return (f"arc length differs by {abs(arcs[worst] - template[worst]):.4g} at sample {worst} "
+            f"({arcs[worst]:.4g} vs {template[worst]:.4g}), tolerance {tol:.4g}")
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--profiles-dir", default="Output_Profiles", help="Root of the per-subject FVP tree")
@@ -162,6 +185,14 @@ def main(argv=None) -> int:
         nargs="+",
         metavar="TRACT",
         help="Only gather these tracts (e.g. Fornix_L Fornix_R); default: every tract found",
+    )
+    p.add_argument(
+        "--arc-tolerance",
+        type=float,
+        default=0.1,
+        metavar="PCT",
+        help="Allowed arc-length deviation from the tract template, in %% of its total "
+             "length (default: 0.1); the sample count must always match exactly",
     )
     p.add_argument("--arc-precision", type=int, default=4, help="Decimals for arc-length column alignment")
     p.add_argument("-v", "--verbose", action="store_true", help="Verbose logging")
@@ -202,7 +233,9 @@ def main(argv=None) -> int:
     # acquisitions in one session become separate columns).
     groups: dict = defaultdict(dict)
     tract_idents: dict = defaultdict(set)  # tract -> all identifiers seen (any metric)
-    n_ok = n_skip = n_filtered = 0
+    # tract -> (arc keys, arc positions, source file, tolerance); first file read wins.
+    tract_arcs: dict = {}
+    n_ok = n_skip = n_filtered = n_arc_mismatch = 0
     for f in files:
         parsed = parse_fvp_name(f, tracts)
         if parsed is None:
@@ -220,6 +253,26 @@ def main(argv=None) -> int:
         if profile is None:
             n_skip += 1
             continue
+        # all FVPs of a tract must sit on the same arc-length grid
+        keys = tuple(profile)
+        arcs = tuple(float(k) for k in keys)
+        if tract not in tract_arcs:
+            length = abs(arcs[-1] - arcs[0]) if len(arcs) > 1 else 0.0
+            tract_arcs[tract] = (keys, arcs, f, length * args.arc_tolerance / 100.0)
+        tmpl_keys, tmpl_arcs, tmpl_file, tol = tract_arcs[tract]
+
+        reason = compare_arc_grid(arcs, tmpl_arcs, tol)
+        if reason is not None:
+            log.warning(
+                "inconsistent profile sampling in %s (%s); template %s - excluding",
+                f, reason, os.path.basename(tmpl_file),
+            )
+            n_arc_mismatch += 1
+            continue
+        if keys != tmpl_keys:  # within tolerance: snap onto the template grid
+            log.debug("snapping %s onto the %s template arc lengths", os.path.basename(f), tract)
+            profile = dict(zip(tmpl_keys, profile.values()))
+
         ident = "_".join(x for x in (subject, session, prefix) if x)
         tract_idents[tract].add(ident)
         if ident in groups[(tract, metric)]:
@@ -232,9 +285,10 @@ def main(argv=None) -> int:
     ]
     all_idents = sorted(set().union(*tract_idents.values())) if tract_idents else []
     log.info(
-        "Parsed %d profiles (%d skipped%s); %d identifiers, %d (tract,metric) tables",
+        "Parsed %d profiles (%d skipped%s%s); %d identifiers, %d (tract,metric) tables",
         n_ok, n_skip,
         f", {n_filtered} excluded by {'/'.join(active_filters)}" if active_filters else "",
+        f", {n_arc_mismatch} excluded for inconsistent sampling" if n_arc_mismatch else "",
         len(all_idents), len(groups),
     )
     if active_filters and not groups and files:
