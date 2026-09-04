@@ -26,6 +26,8 @@ excluded if its sample count differs (exact match required) or an arc length
 deviates from the template by more than ``--arc-tolerance`` percent of the
 template's total tract length (default 0.1%).  Grids that pass within tolerance
 are snapped onto the template's arc-length values so the CSV rows stay aligned.
+With ``--rename-mismatched`` the excluded files are renamed to ``<name>.fvp_exclude``
+on disk, so they no longer show up as FVPs on a later run.
 
 Rows are the arc-length sample positions; columns are one per
 ``<subject>_<session>_<prefix>`` identifier (so multiple acquisitions/prefixes
@@ -164,6 +166,24 @@ def compare_arc_grid(arcs, template, tol):
             f"({arcs[worst]:.4g} vs {template[worst]:.4g}), tolerance {tol:.4g}")
 
 
+def rename_excluded(path: str, suffix: str = "_exclude") -> bool:
+    """Rename an excluded FVP to ``<name>.fvp_exclude``; True when it worked.
+
+    The suffix goes after the extension on purpose: the file then no longer
+    matches ``*.fvp`` and is ignored by later runs.
+    """
+    target = path + suffix
+    try:
+        if os.path.exists(target):
+            log.warning("overwriting existing %s", target)
+        os.replace(path, target)
+    except OSError as exc:
+        log.warning("could not rename %s (%s)", path, exc)
+        return False
+    log.info("renamed %s -> %s", path, os.path.basename(target))
+    return True
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--profiles-dir", default="Output_Profiles", help="Root of the per-subject FVP tree")
@@ -193,6 +213,12 @@ def main(argv=None) -> int:
         metavar="PCT",
         help="Allowed arc-length deviation from the tract template, in %% of its total "
              "length (default: 0.1); the sample count must always match exactly",
+    )
+    p.add_argument(
+        "--rename-mismatched",
+        action="store_true",
+        help="Rename FVP files excluded for inconsistent sampling to <name>.fvp_exclude "
+             "(they are then no longer picked up as FVPs)",
     )
     p.add_argument("--arc-precision", type=int, default=4, help="Decimals for arc-length column alignment")
     p.add_argument("-v", "--verbose", action="store_true", help="Verbose logging")
@@ -268,6 +294,8 @@ def main(argv=None) -> int:
                 f, reason, os.path.basename(tmpl_file),
             )
             n_arc_mismatch += 1
+            if args.rename_mismatched:
+                rename_excluded(f)
             continue
         if keys != tmpl_keys:  # within tolerance: snap onto the template grid
             log.debug("snapping %s onto the %s template arc lengths", os.path.basename(f), tract)
