@@ -45,7 +45,17 @@ comparison into a standardised deviation (z):
   for both small and large angles, degenerating to the tangent-space z-score
   when the spread is small.
 
-Without a normative model, raw subject-vs-atlas scores are used (age-confounded).
+Without a normative model, raw subject-vs-atlas scores are used (age-confounded)
+and the age itself is not needed.
+
+The age of a scan is read from the session folder name (``ses-<N>m`` by default,
+see ``--age-regex``).  Cohorts that name sessions by visit instead (HBCD's
+``ses-V02``, say) supply the ages in a table with ``--age-csv`` (a BIDS
+``participants.tsv`` / ``sessions.tsv`` works: the subject, session and age
+columns are auto-detected; use ``--age-units`` if the ages are not in months).
+Scans whose age stays unknown are still QC'd against the atlas -- only the
+age-binned normative model needs an age, and those scans are skipped there with
+a warning.
 
 Outlier decision is **one combined flag per subject-session** (a bad warp hits
 all metrics/the tensor together).  ``--combine`` picks the rule:
@@ -128,7 +138,84 @@ def parse_bins(spec):
     return [tuple(b) for b in bins]
 
 
+AGE_TABLE_SUBJECT_COLS = ("participant_id", "subject_id", "subject", "sub", "id")
+AGE_TABLE_SESSION_COLS = ("session_id", "session", "ses", "visit_id", "visit")
+AGE_TABLE_AGE_COLS = ("age_months", "age_month", "age_mo", "age_m", "candidate_age",
+                      "age_at_scan", "scan_age", "age")
+
+AGE_UNIT_TO_MONTHS = {"months": 1.0, "years": 12.0, "days": 12.0 / 365.25, "weeks": 12.0 / 52.1775}
+
+
+def _bids_key(value):
+    """'sub-1007170889' / 'SUB-1007170889' -> '1007170889' (entity value, lowercased)."""
+    v = str(value).strip().lower()
+    for pre in ("sub-", "ses-"):
+        if v.startswith(pre):
+            v = v[len(pre):]
+    return v
+
+
+def load_age_table(path, units="months"):
+    """{(subject, session|None): age_in_months} from a CSV/TSV participants/sessions table.
+
+    Column names are auto-detected (BIDS ``participant_id`` / ``session_id`` /
+    ``age`` and common variants); a table without a session column gives one age
+    per subject, applied to all of that subject's sessions.
+    """
+    import csv
+
+    with open(path, newline="") as fh:
+        sample = fh.read(8192)
+        fh.seek(0)
+        try:
+            dialect = csv.Sniffer().sniff(sample, delimiters=",\t;")
+        except csv.Error:
+            dialect = csv.excel_tab if "\t" in sample.splitlines()[0] else csv.excel
+        rows = list(csv.DictReader(fh, dialect=dialect))
+    if not rows:
+        raise ValueError(f"{path} has no data rows")
+
+    have = {c.strip().lower(): c for c in rows[0] if c}
+
+    def pick(cands):
+        return next((have[c] for c in cands if c in have), None)
+
+    sub_col, ses_col, age_col = (pick(AGE_TABLE_SUBJECT_COLS), pick(AGE_TABLE_SESSION_COLS),
+                                pick(AGE_TABLE_AGE_COLS))
+    if sub_col is None or age_col is None:
+        raise ValueError(f"{path}: need a subject and an age column, found {sorted(have)}")
+    scale = AGE_UNIT_TO_MONTHS[units]
+
+    table, n_bad = {}, 0
+    for r in rows:
+        try:
+            age = float(str(r[age_col]).strip()) * scale
+        except (TypeError, ValueError):  # BIDS 'n/a' and friends
+            n_bad += 1
+            continue
+        key = (_bids_key(r[sub_col]), _bids_key(r[ses_col]) if ses_col else None)
+        table[key] = int(round(age))
+    log.info("Age table %s: %d entries from columns (%s, %s, %s in %s)%s",
+             path, len(table), sub_col, ses_col or "-", age_col, units,
+             f"; {n_bad} row(s) without a usable age" if n_bad else "")
+    if not table:
+        raise ValueError(f"{path}: no usable ages in column '{age_col}'")
+    return table
+
+
+def age_for_session(subject, session, age_table, age_re):
+    """Age in months from the table (session- then subject-level), else the session name."""
+    if age_table:
+        for key in ((_bids_key(subject), _bids_key(session)), (_bids_key(subject), None)):
+            if key in age_table:
+                return age_table[key]
+    m = age_re.search(session)
+    return int(m.group(1)) if m else None
+
+
 def bin_label_for_age(age, bins):
+    if age is None:
+        return None
     for lo, hi, label in bins:
         if lo <= age <= hi:
             return label
@@ -166,21 +253,25 @@ def parse_deformed(basename):
     return m.group("sub"), m.group("ses"), prefix, m.group("metric")
 
 
-def find_sessions(root):
+def find_sessions(root, age_table=None, age_re=AGE_RE):
     """Discover scans (one per subject/session/prefix) with metric/tensor paths.
 
     Multiple acquisitions in the same session (different prefixes) become
     separate scan entries keyed by the full ``sub_ses_prefix`` identifier.
+
+    ``age`` is None when neither *age_table* nor the session name supplies one;
+    such scans are still returned (age is only *required* for the age-binned
+    normative model -- the caller decides).
     """
     scans = {}  # (subject, session, prefix) -> entry
+    no_age = []
     for reg in sorted(glob.glob(os.path.join(root, "sub-*", "ses-*", "AtlasReg"))):
         ses_dir = os.path.dirname(reg)
         session = os.path.basename(ses_dir)
-        am = AGE_RE.search(session)
-        if am is None:
-            log.warning("no age in %s; skipping", ses_dir)
-            continue
-        age = int(am.group(1))
+        subject_dir = os.path.basename(os.path.dirname(ses_dir))
+        age = age_for_session(subject_dir, session, age_table, age_re)
+        if age is None:
+            no_age.append(ses_dir)
         for f in sorted(glob.glob(os.path.join(reg, "*_Deformed*.nii.gz"))
                         + glob.glob(os.path.join(reg, "*_DeformedDTI.nrrd"))):
             parsed = parse_deformed(os.path.basename(f))
@@ -196,6 +287,12 @@ def find_sessions(root):
                 entry["tensor"] = f
             elif metric in ALL_SCALARS:
                 entry["scalars"][metric] = f
+    if no_age:
+        log.warning("no age information for %d session(s) (e.g. %s)%s", len(no_age),
+                    ", ".join("/".join(d.split(os.sep)[-2:]) for d in no_age[:3]),
+                    "" if len(no_age) < 4 else ", ...")
+        log.warning("  the session name carries no age and no --age-csv entry matched; "
+                    "raw QC still runs, but the age-binned normative model cannot be used")
     return [scans[k] for k in sorted(scans)]
 
 
@@ -623,7 +720,7 @@ def qc_subject(s, atlas, bins, normative_dir, cfg, out_dir=None):
         st, ssim_blobs = blob_stats(ssim_map < ssim_cut, mask, cfg["blob_top_k"])
         add_blob_row(row, f"{m}_ssim", st)
 
-        znorm = load_normative_scalar(normative_dir, label, m) if normative_dir else None
+        znorm = load_normative_scalar(normative_dir, label, m) if (normative_dir and label) else None
         z, z_blobs = None, None
         if znorm is not None:
             mean, std = znorm
@@ -656,7 +753,7 @@ def qc_subject(s, atlas, bins, normative_dir, cfg, out_dir=None):
             maps["angular_deg"] = ang
             maps["angular_deg_blobs"] = ang_blobs
 
-        na = load_normative_angular(normative_dir, label) if normative_dir else None
+        na = load_normative_angular(normative_dir, label) if (normative_dir and label) else None
         if na is not None:
             mu, sigma = na
             valid = wm & np.isfinite(sigma) & (np.linalg.norm(mu, axis=-1) > 0)
@@ -692,6 +789,8 @@ def qc_subject(s, atlas, bins, normative_dir, cfg, out_dir=None):
 def robust_z(x):
     """MAD-based z-score (median/1.4826·MAD); 0 where scale is degenerate."""
     x = np.asarray(x, dtype=float)
+    if x.size == 0 or not np.isfinite(x).any():  # empty cohort / metric never computed
+        return np.zeros_like(x)
     med = np.nanmedian(x)
     mad = np.nanmedian(np.abs(x - med))
     scale = 1.4826 * mad
@@ -769,7 +868,11 @@ def robust_mahalanobis(X, names, support=0.85, min_ratio=5.0, corr_max=0.995):
     Z, keep = [], []
     for j, name in enumerate(names):
         col = X[:, j].astype(float)
-        col = np.where(np.isfinite(col), col, np.nanmedian(col))  # median-impute
+        finite = np.isfinite(col)
+        if not finite.any():
+            log.debug("mahalanobis: dropping all-NaN feature %s", name)
+            continue
+        col = np.where(finite, col, np.median(col[finite]))  # median-impute
         if "frac" in name.lower():  # voxel fractions -> log scale
             pos = col[col > 0]
             col = np.log10(col + (pos.min() / 2 if pos.size else 1e-9))
@@ -830,6 +933,14 @@ def main(argv=None) -> int:
     p.add_argument("--normative-dir", default=None, help="Age-conditional normative model folder (read or write)")
     p.add_argument("--build-normative", action="store_true", help="Build the normative model and exit")
     p.add_argument("--bins", default="0-3,4-9,10-60", help="Age bins (months, inclusive; oldest open-ended)")
+    p.add_argument("--age-csv", default=None,
+                   help="CSV/TSV with per-subject (and optionally per-session) ages, for cohorts whose "
+                        "session names carry a visit label instead of an age (e.g. ses-V02); columns "
+                        "participant_id/session_id/age are auto-detected")
+    p.add_argument("--age-units", default="months", choices=sorted(AGE_UNIT_TO_MONTHS),
+                   help="Units of the --age-csv age column (default: months)")
+    p.add_argument("--age-regex", default=AGE_RE.pattern,
+                   help=f"Regex whose first group is the session-name age in months (default: {AGE_RE.pattern!r})")
     p.add_argument("--scalar-metrics", default="FA", help="Comma list of scalar metrics to QC (default: FA)")
     p.add_argument("--no-angular", action="store_true", help="Skip the tensor angular-error metric")
     p.add_argument("--mask-threshold", type=float, default=1e-3, help="FA threshold for the brain mask (default: 1e-3)")
@@ -876,6 +987,17 @@ def main(argv=None) -> int:
     do_angular = (not args.no_angular) and atlas_tensor is not None
     bins = parse_bins(args.bins)
 
+    try:
+        age_re = re.compile(args.age_regex)
+    except re.error as exc:
+        p.error(f"--age-regex is not a valid regex: {exc}")
+    age_table = None
+    if args.age_csv:
+        try:
+            age_table = load_age_table(args.age_csv, args.age_units)
+        except (OSError, ValueError) as exc:
+            p.error(f"--age-csv: {exc}")
+
     atlas_fa, _ = load_scalar(atlas_scalar_paths["FA"])
     atlas_wm = atlas_fa > args.angular_fa_min
     atlas_pd = principal_directions(atlas_tensor, atlas_wm) if do_angular else None
@@ -896,7 +1018,21 @@ def main(argv=None) -> int:
         ref_dir = args.reference_dir or args.data_dir
         if not args.normative_dir:
             p.error("--build-normative requires --normative-dir")
-        sessions = find_sessions(ref_dir)
+        sessions = find_sessions(ref_dir, age_table, age_re)
+        if not sessions:
+            log.error("no reference sessions found under %s -- expected "
+                      "%s/sub-*/ses-*/AtlasReg/*_Deformed*.nii.gz", ref_dir, ref_dir)
+            return 1
+        dated = [s for s in sessions if s["age"] is not None]
+        if len(dated) < len(sessions):
+            log.warning("skipping %d reference session(s) without an age: the normative model is "
+                        "age-binned, so supply --age-csv (or --age-regex) to include them",
+                        len(sessions) - len(dated))
+        if not dated:
+            log.error("no reference session has an age, so no age bin can be filled; "
+                      "supply --age-csv with the ages for %s", ref_dir)
+            return 1
+        sessions = dated
         log.info("Building normative from %d reference sessions in %s", len(sessions), ref_dir)
         flip_name, flip = resolve_flip(sessions)
         build_normative(sessions, atlas_scalar_paths, atlas_fa, bins, scalar_metrics, do_angular,
@@ -939,7 +1075,12 @@ def main(argv=None) -> int:
                          int(roi.sum()), float(atlas_fa[roi].mean()), float(atlas["md"][roi].mean()),
                          args.out_dir)
 
-    sessions = find_sessions(args.data_dir)
+    sessions = find_sessions(args.data_dir, age_table, age_re)
+    if not sessions:
+        log.error("no sessions found under %s -- expected %s/sub-*/ses-*/AtlasReg/*_Deformed*.nii.gz "
+                  "(session folder names must carry the age, e.g. ses-V06_age-06mo)",
+                  args.data_dir, args.data_dir)
+        return 1
     flip_name, flip = resolve_flip(sessions)
     if normative_dir and do_angular and atlas_pd is not None:
         check_normative_frame(normative_dir, bins, atlas_pd, atlas_fa, args.angular_fa_min, flip_name)
@@ -949,6 +1090,19 @@ def main(argv=None) -> int:
            "z_thresh": args.z_thresh, "flip": flip,
            "ssim_blob_pct": args.ssim_blob_pct, "ang_blob_deg": args.ang_blob_deg,
            "blob_top_k": args.blob_top_k}
+
+    if normative_dir:
+        dated = [s for s in sessions if s["age"] is not None]
+        if len(dated) < len(sessions):
+            log.warning("skipping %d session(s) without an age: they cannot be placed in a "
+                        "normative age bin -- supply --age-csv (or --age-regex), or drop "
+                        "--normative-dir to run the raw atlas-comparison QC instead",
+                        len(sessions) - len(dated))
+        if not dated:
+            log.error("no session has an age, so none can be matched to a normative bin; "
+                      "supply --age-csv, or run without a normative model")
+            return 1
+        sessions = dated
 
     log.info("QC on %d sessions", len(sessions))
 
@@ -960,8 +1114,15 @@ def main(argv=None) -> int:
             continue
         rows.append(qc_subject(s, atlas, bins, normative_dir, cfg, args.out_dir if save_all else None))
         scored.append(s)
-        log.info("  scored %s (age %dm, bin %s)%s", s["id"], s["age"], rows[-1]["bin"],
+        log.info("  scored %s (age %s, bin %s)%s", s["id"],
+                 f"{s['age']}m" if s["age"] is not None else "unknown", rows[-1]["bin"],
                  " [maps saved]" if save_all else "")
+
+    if not rows:
+        log.error("none of the %d session(s) under %s had a deformed FA map, so nothing was scored; "
+                  "check that AtlasReg contains *_DeformedFA.nii.gz (or adjust --scalar-metrics)",
+                  len(sessions), args.data_dir)
+        return 1
 
     import pandas as pd
     df = pd.DataFrame(rows)
