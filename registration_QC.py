@@ -52,7 +52,9 @@ The age of a scan is read from the session folder name (``ses-<N>m`` by default,
 see ``--age-regex``).  Cohorts that name sessions by visit instead (HBCD's
 ``ses-V02``, say) supply the ages in a table with ``--age-csv`` (a BIDS
 ``participants.tsv`` / ``sessions.tsv`` works: the subject, session and age
-columns are auto-detected; use ``--age-units`` if the ages are not in months).
+columns are auto-detected -- an age column named after none of the usual
+conventions is still found by a partial ``candidate_age`` match; use
+``--age-units`` if the ages are not in months).
 Scans whose age stays unknown are still QC'd against the atlas -- only the
 age-binned normative model needs an age, and those scans are skipped there with
 a warning.
@@ -142,6 +144,9 @@ AGE_TABLE_SUBJECT_COLS = ("participant_id", "subject_id", "subject", "sub", "id"
 AGE_TABLE_SESSION_COLS = ("session_id", "session", "ses", "visit_id", "visit")
 AGE_TABLE_AGE_COLS = ("age_months", "age_month", "age_mo", "age_m", "candidate_age",
                       "age_at_scan", "scan_age", "age")
+# fallback when none of the above matches exactly: any column whose name contains
+# one of these (HBCD ships e.g. 'candidate_age_months', 'visit_candidate_age')
+AGE_TABLE_AGE_SUBSTRINGS = ("candidate_age",)
 
 AGE_UNIT_TO_MONTHS = {"months": 1.0, "years": 12.0, "days": 12.0 / 365.25, "weeks": 12.0 / 52.1775}
 
@@ -159,7 +164,9 @@ def load_age_table(path, units="months"):
     """{(subject, session|None): age_in_months} from a CSV/TSV participants/sessions table.
 
     Column names are auto-detected (BIDS ``participant_id`` / ``session_id`` /
-    ``age`` and common variants); a table without a session column gives one age
+    ``age`` and common variants); failing an exact match, an age column is taken
+    from a partial name match on ``candidate_age`` (HBCD-style headers such as
+    ``candidate_age_months``).  A table without a session column gives one age
     per subject, applied to all of that subject's sessions.
     """
     import csv
@@ -182,8 +189,16 @@ def load_age_table(path, units="months"):
 
     sub_col, ses_col, age_col = (pick(AGE_TABLE_SUBJECT_COLS), pick(AGE_TABLE_SESSION_COLS),
                                 pick(AGE_TABLE_AGE_COLS))
+    if age_col is None:  # no exact hit -> partial match (in column order)
+        age_col = next((have[c] for c in have
+                        if any(frag in c for frag in AGE_TABLE_AGE_SUBSTRINGS)), None)
+        if age_col is not None:
+            log.info("no standard age column in %s; using '%s' (partial match on %s)",
+                     path, age_col, "/".join(AGE_TABLE_AGE_SUBSTRINGS))
     if sub_col is None or age_col is None:
-        raise ValueError(f"{path}: need a subject and an age column, found {sorted(have)}")
+        raise ValueError(f"{path}: need a subject and an age column "
+                         f"({', '.join(AGE_TABLE_AGE_COLS)}, or a name containing "
+                         f"{'/'.join(AGE_TABLE_AGE_SUBSTRINGS)}), found {sorted(have)}")
     scale = AGE_UNIT_TO_MONTHS[units]
 
     table, n_bad = {}, 0
@@ -936,7 +951,8 @@ def main(argv=None) -> int:
     p.add_argument("--age-csv", default=None,
                    help="CSV/TSV with per-subject (and optionally per-session) ages, for cohorts whose "
                         "session names carry a visit label instead of an age (e.g. ses-V02); columns "
-                        "participant_id/session_id/age are auto-detected")
+                        "participant_id/session_id/age are auto-detected, as is any column "
+                        "whose name contains 'candidate_age'")
     p.add_argument("--age-units", default="months", choices=sorted(AGE_UNIT_TO_MONTHS),
                    help="Units of the --age-csv age column (default: months)")
     p.add_argument("--age-regex", default=AGE_RE.pattern,
