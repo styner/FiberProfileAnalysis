@@ -107,6 +107,7 @@ import argparse
 import glob
 import json
 import logging
+import math
 import os
 import re
 import sys
@@ -659,6 +660,40 @@ def check_normative_frame(normative_dir, bins, atlas_pd, atlas_fa, angular_fa_mi
                      "directions are consistent -- the manifest label is stale)", nf, flip_name)
 
 
+def check_normative_thresholds(normative_dir, mask_thr, angular_fa_min, do_angular):
+    """FA thresholds in force vs the ones the normative model was built with.
+
+    Both thresholds define the *voxel support* the model's per-voxel statistics
+    were accumulated over, so a mismatch silently standardises the subject over
+    a different set of voxels than the reference mean/std describe.  Returns the
+    list of ``(flag, model_value, current_value)`` that disagree.
+    """
+    path = os.path.join(normative_dir, "manifest.json")
+    try:
+        with open(path) as fh:
+            manifest = json.load(fh)
+    except (OSError, ValueError) as exc:
+        log.warning("cannot read %s (%s); the model's FA thresholds were not verified", path, exc)
+        return []
+
+    checks = [("mask_threshold", "--mask-threshold", mask_thr)]
+    if do_angular:
+        checks.append(("angular_fa_min", "--angular-fa-min", angular_fa_min))
+    bad, verified = [], []
+    for key, flag, current in checks:
+        ref = manifest.get(key)
+        if ref is None:  # model predates the manifest entry
+            log.warning("%s does not record '%s'; cannot verify that %s %g matches the model",
+                        path, key, flag, current)
+        elif not math.isclose(float(ref), float(current), rel_tol=1e-9, abs_tol=1e-12):
+            bad.append((flag, float(ref), float(current)))
+        else:
+            verified.append(f"{flag} {current:g}")
+    if verified and not bad:
+        log.info("normative FA thresholds match the model (%s)", ", ".join(verified))
+    return bad
+
+
 def load_normative_angular(normative_dir, label):
     d = os.path.join(normative_dir, label)
     if not os.path.isfile(os.path.join(d, "angular_mu.nii.gz")):
@@ -979,6 +1014,9 @@ def main(argv=None) -> int:
                    help="Correct a subject-vs-atlas tensor-frame axis reflection (default: auto-detect)")
     p.add_argument("--angular-sigma-floor", type=float, default=0.035, help="Floor on angular dispersion (~sin 2°)")
     p.add_argument("--min-count", type=int, default=2, help="Min reference subjects per voxel for a valid normative")
+    p.add_argument("--ignore-threshold-mismatch", action="store_true",
+                   help="Downgrade the FA-threshold mismatch against the normative model from an "
+                        "error to a warning (the z-scores are then not comparable to the model)")
     p.add_argument("--z-thresh", type=float, default=3.0, help="|z| threshold for extreme-voxel fractions (default: 3)")
     p.add_argument("--ssim-blob-pct", type=float, default=5.0,
                    help="Worst-SSIM percentile defining a dissimilar voxel for the blob metrics (default: 5)")
@@ -1108,6 +1146,21 @@ def main(argv=None) -> int:
                 log.info("CSF ROI: %d voxels (atlas FA %.3f, MD %.3g) -> %s/csf_roi.nii.gz",
                          int(roi.sum()), float(atlas_fa[roi].mean()), float(atlas["md"][roi].mean()),
                          args.out_dir)
+
+    if normative_dir:
+        bad = check_normative_thresholds(normative_dir, args.mask_threshold,
+                                         args.angular_fa_min, do_angular)
+        if bad:
+            for flag, ref, current in bad:
+                log.error("normative model was built with %s %g, this run uses %g",
+                          flag, ref, current)
+            log.error("the FA thresholds set the voxel support of every metric, so the z-scores "
+                      "would not be comparable with the model's mean/std -- rerun with %s, "
+                      "rebuild the model, or pass --ignore-threshold-mismatch",
+                      " ".join(f"{flag} {ref:g}" for flag, ref, _ in bad))
+            if not args.ignore_threshold_mismatch:
+                return 1
+            log.warning("--ignore-threshold-mismatch given: continuing with mismatched thresholds")
 
     sessions = find_sessions(args.data_dir, age_table, age_re)
     if not sessions:
