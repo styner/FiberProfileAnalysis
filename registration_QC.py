@@ -53,8 +53,9 @@ see ``--age-regex``).  Cohorts that name sessions by visit instead (HBCD's
 ``ses-V02``, say) supply the ages in a table with ``--age-csv`` (a BIDS
 ``participants.tsv`` / ``sessions.tsv`` works: the subject, session and age
 columns are auto-detected -- an age column named after none of the usual
-conventions is still found by a partial ``candidate_age`` match; use
-``--age-units`` if the ages are not in months).
+conventions is still found by a partial ``candidate_age`` match, or can be named
+outright with ``--age-column``; use ``--age-units`` if the ages are not in
+months).
 Scans whose age stays unknown are still QC'd against the atlas -- only the
 age-binned normative model needs an age, and those scans are skipped there with
 a warning.
@@ -160,14 +161,16 @@ def _bids_key(value):
     return v
 
 
-def load_age_table(path, units="months"):
+def load_age_table(path, units="months", age_column=None):
     """{(subject, session|None): age_in_months} from a CSV/TSV participants/sessions table.
 
-    Column names are auto-detected (BIDS ``participant_id`` / ``session_id`` /
-    ``age`` and common variants); failing an exact match, an age column is taken
-    from a partial name match on ``candidate_age`` (HBCD-style headers such as
-    ``candidate_age_months``).  A table without a session column gives one age
-    per subject, applied to all of that subject's sessions.
+    *age_column* names the age column explicitly (case-insensitive); without it
+    the column is auto-detected (BIDS ``age`` and common variants, then a
+    partial name match on ``candidate_age`` for HBCD-style headers such as
+    ``candidate_age_months``).  The subject and session columns are always
+    auto-detected (``participant_id`` / ``session_id`` and variants); a table
+    without a session column gives one age per subject, applied to all of that
+    subject's sessions.
     """
     import csv
 
@@ -187,18 +190,27 @@ def load_age_table(path, units="months"):
     def pick(cands):
         return next((have[c] for c in cands if c in have), None)
 
-    sub_col, ses_col, age_col = (pick(AGE_TABLE_SUBJECT_COLS), pick(AGE_TABLE_SESSION_COLS),
-                                pick(AGE_TABLE_AGE_COLS))
-    if age_col is None:  # no exact hit -> partial match (in column order)
-        age_col = next((have[c] for c in have
-                        if any(frag in c for frag in AGE_TABLE_AGE_SUBSTRINGS)), None)
-        if age_col is not None:
-            log.info("no standard age column in %s; using '%s' (partial match on %s)",
-                     path, age_col, "/".join(AGE_TABLE_AGE_SUBSTRINGS))
-    if sub_col is None or age_col is None:
-        raise ValueError(f"{path}: need a subject and an age column "
+    sub_col, ses_col = pick(AGE_TABLE_SUBJECT_COLS), pick(AGE_TABLE_SESSION_COLS)
+    if age_column:  # user-specified column wins over any auto-detection
+        age_col = have.get(age_column.strip().lower())
+        if age_col is None:
+            raise ValueError(f"{path}: no column '{age_column}', found {sorted(have)}")
+    else:
+        age_col = pick(AGE_TABLE_AGE_COLS)
+        if age_col is None:  # no exact hit -> partial match (in column order)
+            age_col = next((have[c] for c in have
+                            if any(frag in c for frag in AGE_TABLE_AGE_SUBSTRINGS)), None)
+            if age_col is not None:
+                log.info("no standard age column in %s; using '%s' (partial match on %s)",
+                         path, age_col, "/".join(AGE_TABLE_AGE_SUBSTRINGS))
+    if sub_col is None:
+        raise ValueError(f"{path}: need a subject column "
+                         f"({', '.join(AGE_TABLE_SUBJECT_COLS)}), found {sorted(have)}")
+    if age_col is None:
+        raise ValueError(f"{path}: need an age column "
                          f"({', '.join(AGE_TABLE_AGE_COLS)}, or a name containing "
-                         f"{'/'.join(AGE_TABLE_AGE_SUBSTRINGS)}), found {sorted(have)}")
+                         f"{'/'.join(AGE_TABLE_AGE_SUBSTRINGS)}) -- name it with --age-column; "
+                         f"found {sorted(have)}")
     scale = AGE_UNIT_TO_MONTHS[units]
 
     table, n_bad = {}, 0
@@ -953,6 +965,8 @@ def main(argv=None) -> int:
                         "session names carry a visit label instead of an age (e.g. ses-V02); columns "
                         "participant_id/session_id/age are auto-detected, as is any column "
                         "whose name contains 'candidate_age'")
+    p.add_argument("--age-column", default=None, metavar="NAME",
+                   help="Name of the --age-csv column holding the age (default: auto-detect)")
     p.add_argument("--age-units", default="months", choices=sorted(AGE_UNIT_TO_MONTHS),
                    help="Units of the --age-csv age column (default: months)")
     p.add_argument("--age-regex", default=AGE_RE.pattern,
@@ -1008,9 +1022,11 @@ def main(argv=None) -> int:
     except re.error as exc:
         p.error(f"--age-regex is not a valid regex: {exc}")
     age_table = None
+    if args.age_column and not args.age_csv:
+        p.error("--age-column only applies to --age-csv")
     if args.age_csv:
         try:
-            age_table = load_age_table(args.age_csv, args.age_units)
+            age_table = load_age_table(args.age_csv, args.age_units, args.age_column)
         except (OSError, ValueError) as exc:
             p.error(f"--age-csv: {exc}")
 
@@ -1041,9 +1057,11 @@ def main(argv=None) -> int:
             return 1
         dated = [s for s in sessions if s["age"] is not None]
         if len(dated) < len(sessions):
-            log.warning("skipping %d reference session(s) without an age: the normative model is "
-                        "age-binned, so supply --age-csv (or --age-regex) to include them",
-                        len(sessions) - len(dated))
+            undated = [s["id"] for s in sessions if s["age"] is None]
+            log.warning("skipping %d of %d reference session(s) without an age (%s%s): the "
+                        "normative model is age-binned, so supply --age-csv (or --age-regex) "
+                        "to include them", len(undated), len(sessions), ", ".join(undated[:3]),
+                        ", ..." if len(undated) > 3 else "")
         if not dated:
             log.error("no reference session has an age, so no age bin can be filled; "
                       "supply --age-csv with the ages for %s", ref_dir)
@@ -1110,10 +1128,12 @@ def main(argv=None) -> int:
     if normative_dir:
         dated = [s for s in sessions if s["age"] is not None]
         if len(dated) < len(sessions):
-            log.warning("skipping %d session(s) without an age: they cannot be placed in a "
-                        "normative age bin -- supply --age-csv (or --age-regex), or drop "
-                        "--normative-dir to run the raw atlas-comparison QC instead",
-                        len(sessions) - len(dated))
+            undated = [s["id"] for s in sessions if s["age"] is None]
+            log.warning("skipping %d of %d session(s) without an age (%s%s): they cannot be placed "
+                        "in a normative age bin -- supply --age-csv (or --age-regex), or drop "
+                        "--normative-dir to run the raw atlas-comparison QC on the whole cohort",
+                        len(undated), len(sessions), ", ".join(undated[:3]),
+                        ", ..." if len(undated) > 3 else "")
         if not dated:
             log.error("no session has an age, so none can be matched to a normative bin; "
                       "supply --age-csv, or run without a normative model")
@@ -1159,6 +1179,15 @@ def main(argv=None) -> int:
         if do_angular and "ANG_meanDeg" in df:
             parts.append(robust_z(df["ANG_meanDeg"].to_numpy()))
         df["combined_score"] = np.mean(np.vstack(parts), axis=0) if parts else np.nan
+
+    unscored = [r.id for r in df.itertuples() if not np.isfinite(r.combined_score)]
+    if unscored:
+        log.warning("%d of %d session(s) have no combined score and can never be flagged (%s%s): "
+                    "their metrics are missing -- with a normative model this usually means the "
+                    "model has no data for their age bin (%s)",
+                    len(unscored), len(df), ", ".join(unscored[:3]),
+                    ", ..." if len(unscored) > 3 else "",
+                    ", ".join(sorted({str(b) for b in df.loc[df["id"].isin(unscored), "bin"]})))
 
     df["combined_robust_z"] = robust_z(df["combined_score"].to_numpy())
 
