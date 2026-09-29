@@ -106,6 +106,20 @@ Other column mapping
 * ``remaining_number_of_gradients`` -- all remaining volumes, baselines included
   (as in the report, where remaining + excluded is the full gradient list).
 
+AP / PA pairs
+-------------
+A confounds file often holds both phase-encoding directions of one acquisition
+(``original_file`` = ``..._dir-AP_..._dwi`` and ``..._dir-PA_..._dwi``).  By
+default each direction is its own row, as ``original_file`` names two scans.
+With ``--sum-ap-pa`` the rows that differ only in their ``dir-`` entity are
+merged into one by summation -- remaining, excluded and every
+``*_larger_than_*`` count are added, which is exactly what counting over the
+pooled volumes of both directions gives -- and the merged row's prefix drops the
+``dir-`` entity (``acq-dir79select_dir-AP_run-001_dwi`` ->
+``acq-dir79select_run-001_dwi``).  Rows that differ in anything else (a
+different ``run-``, say) stay separate; ``--combine`` is the blunter tool that
+merges every run in a file regardless.
+
 The first volume of a scan has no predecessor, so its motion is undefined
 (``n/a``) and it is never counted as high-motion.  Where one confounds file
 concatenates several source runs (``original_file``), the value spanning a run
@@ -117,6 +131,7 @@ Usage
     python prep_qc_from_confounds.py sub-G0MXBE3C_ses-00A_confounds.tsv
     python prep_qc_from_confounds.py QSIPrepOutput/ -o PrepQC/DWIQC_report_hbcd.csv
     python prep_qc_from_confounds.py QSIPrepOutput/ --motion-measure rms
+    python prep_qc_from_confounds.py QSIPrepOutput/ --motion-measure rms --sum-ap-pa
 """
 
 from __future__ import annotations
@@ -277,6 +292,46 @@ def motion_row(motion, n_volumes, exclude_cut, cuts, count_among):
     return row
 
 
+DIR_ENTITY_RE = re.compile(r"(?:^|_)dir-[^_]+")
+
+
+def pair_key(prefix):
+    """The prefix with its phase-encoding ``dir-`` entity removed, or None if it has none."""
+    stripped = DIR_ENTITY_RE.sub("", prefix, count=1).lstrip("_")
+    return stripped if stripped != prefix else None
+
+
+def merge_ap_pa(path, groups):
+    """Merge runs of *groups* that differ only in their ``dir-`` entity.
+
+    Returns ``[(original_file, index array, prefix override or None)]``; a merged
+    group pools the volumes of its runs (so each count is the sum over the
+    directions) and carries the direction-free prefix.
+    """
+    buckets, order = {}, []
+    for original_file, idx in groups:
+        ident = scan_identity(path, original_file)
+        key = pair_key(ident[2]) if ident else None
+        bucket_id = (ident[0], ident[1], key) if key else ("__single__", original_file, len(order))
+        if bucket_id not in buckets:
+            buckets[bucket_id] = []
+            order.append(bucket_id)
+        buckets[bucket_id].append((original_file, idx))
+
+    merged = []
+    for bucket_id in order:
+        members = buckets[bucket_id]
+        if len(members) == 1:
+            merged.append((members[0][0], members[0][1], None))
+            continue
+        log.info("%s: summing %d phase-encoding directions (%s) into %s",
+                 os.path.basename(path), len(members),
+                 ", ".join(DIR_ENTITY_RE.search(scan_identity(path, of)[2]).group().lstrip("_")
+                           for of, _ in members), bucket_id[2])
+        merged.append((members[0][0], np.concatenate([idx for _, idx in members]), bucket_id[2]))
+    return merged
+
+
 def run_groups(df):
     """[(original_file, row index array)] in order of appearance; one group if absent."""
     if RUN_COLUMN not in df:
@@ -334,20 +389,23 @@ def scan_rows(path, args):
     for _, idx in runs:
         usable[idx[0]] = False
 
-    groups = runs
+    groups = [(of, idx, None) for of, idx in runs]
     if len(runs) > 1:
         if args.combine:
-            groups = [(runs[0][0], np.arange(len(df)))]
-        else:
-            log.info("%s: %d source runs -> one row each", os.path.basename(path), len(runs))
+            groups = [(runs[0][0], np.arange(len(df)), None)]
+        elif args.sum_ap_pa:
+            groups = merge_ap_pa(path, runs)
+        if len(groups) > 1:
+            log.info("%s: %d source runs -> %d row(s)", os.path.basename(path), len(runs), len(groups))
 
     rows = []
-    for original_file, idx in groups:
+    for original_file, idx, prefix_override in groups:
         ident = scan_identity(path, original_file)
         if ident is None:
             log.warning("no sub-/ses- identity for %s; skipping", path)
             continue
         sub, ses, prefix = ident
+        prefix = prefix_override or prefix
         motion = motion_all[idx][usable[idx]]
 
         row = {"sub": sub, "ses": ses, "prefix": prefix}
@@ -423,6 +481,10 @@ def main(argv=None) -> int:
                    help="Recompute FD from trans_*/rot_* instead of using the "
                         f"'{FD_COLUMN}' column (needed for a non-default --fd-radius)")
 
+    p.add_argument("--sum-ap-pa", action="store_true",
+                   help="Merge rows of one confounds file that differ only in their dir- "
+                        "(phase-encoding) entity, e.g. dir-AP and dir-PA, by summing their counts; "
+                        "the merged prefix drops the dir- entity")
     p.add_argument("--combine", action="store_true",
                    help="One row per confounds file even when it concatenates several source "
                         "runs (default: one row per original_file, as the report is per-scan)")
@@ -430,6 +492,8 @@ def main(argv=None) -> int:
                    help="Add diagnostic columns (volume counts, mean/median/max motion, factor)")
     p.add_argument("-v", "--verbose", action="store_true", help="Verbose logging")
     args = p.parse_args(argv)
+    if args.combine and args.sum_ap_pa:
+        p.error("--combine already merges every run of a file; use one or the other")
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(levelname)s | %(message)s", stream=sys.stderr)
