@@ -106,19 +106,27 @@ Other column mapping
 * ``remaining_number_of_gradients`` -- all remaining volumes, baselines included
   (as in the report, where remaining + excluded is the full gradient list).
 
-AP / PA pairs
--------------
-A confounds file often holds both phase-encoding directions of one acquisition
-(``original_file`` = ``..._dir-AP_..._dwi`` and ``..._dir-PA_..._dwi``).  By
-default each direction is its own row, as ``original_file`` names two scans.
-With ``--sum-ap-pa`` the rows that differ only in their ``dir-`` entity are
-merged into one by summation -- remaining, excluded and every
-``*_larger_than_*`` count are added, which is exactly what counting over the
-pooled volumes of both directions gives -- and the merged row's prefix drops the
-``dir-`` entity (``acq-dir79select_dir-AP_run-001_dwi`` ->
-``acq-dir79select_run-001_dwi``).  Rows that differ in anything else (a
-different ``run-``, say) stay separate; ``--combine`` is the blunter tool that
-merges every run in a file regardless.
+AP / PA pairs and repeated runs
+-------------------------------
+A confounds file often holds both phase-encoding directions of one acquisition,
+and frequently several runs of each (``original_file`` =
+``..._dir-AP_run-01_dwi``, ``..._dir-PA_run-01_dwi``, ``..._dir-AP_run-02_dwi``,
+...).  By default each is its own row, as ``original_file`` names separate
+scans.
+
+``--sum-ap-pa`` merges the rows that belong to the *same acquisition* by
+summation: remaining, excluded and every ``*_larger_than_*`` count are added,
+which is exactly what counting over the pooled volumes of all of them gives.
+Rows belong together when they differ only in the entities listed by
+``--sum-entities``, which defaults to ``dir run`` -- so both directions of every
+run collapse into a single row, and the merged prefix drops those entities
+(``acq-dir79select_dir-AP_run-01_dwi`` -> ``acq-dir79select_dwi``).  Pass
+``--sum-entities dir`` to pair the directions but keep one row per run, or add
+further entities for cohorts that split an acquisition some other way.
+
+A row whose prefix carries none of those entities has nothing to pair with and
+is left alone, so a single-scan file is unaffected.  ``--combine`` remains the
+blunter tool: it merges every run of a file whatever the names say.
 
 The first volume of a scan has no predecessor, so its motion is undefined
 (``n/a``) and it is never counted as high-motion.  Where one confounds file
@@ -162,6 +170,10 @@ FACTOR_BOUNDS = (1.0, np.sqrt(6.0))  # L1 vs L2 norm of a six-vector (the ideal 
 # Generous range for a *measured* ratio: outside this something is wrong (unit
 # confusion, a degenerate scan) rather than merely unusual motion.
 FACTOR_SANITY = (0.5, 3.5)
+
+# BIDS entities that --sum-ap-pa ignores when deciding which rows of one
+# confounds file are the same acquisition; see "AP / PA pairs" above.
+DEFAULT_SUM_ENTITIES = ("dir", "run")
 
 # sub-<id>_ses-<id>_<prefix>, as in prep_qc_reformat.py (the sub-/ses- tags are
 # stripped in the report, so they are stripped here too).
@@ -292,31 +304,39 @@ def motion_row(motion, n_volumes, exclude_cut, cuts, count_among):
     return row
 
 
-DIR_ENTITY_RE = re.compile(r"(?:^|_)dir-[^_]+")
+def entity_pattern(entities):
+    """Regex matching any ``_<entity>-<value>`` span for the given entity names."""
+    return re.compile(r"(?:^|_)(?:%s)-[^_]+" % "|".join(re.escape(e) for e in entities))
 
 
-def pair_key(prefix):
-    """The prefix with its phase-encoding ``dir-`` entity removed, or None if it has none."""
-    stripped = DIR_ENTITY_RE.sub("", prefix, count=1).lstrip("_")
-    return stripped if stripped != prefix else None
+def sum_key(prefix, pattern):
+    """``(stripped prefix, entities found)`` with the summed-over entities removed.
 
-
-def merge_ap_pa(path, groups):
-    """Merge runs of *groups* that differ only in their ``dir-`` entity.
-
-    Returns ``[(original_file, index array, prefix override or None)]``; a merged
-    group pools the volumes of its runs (so each count is the sum over the
-    directions) and carries the direction-free prefix.
+    ``(None, [])`` when the prefix carries none of them -- the row then has
+    nothing it could be summed with and stays on its own.
     """
+    found = [m.group().lstrip("_") for m in pattern.finditer(prefix)]
+    if not found:
+        return None, []
+    return pattern.sub("", prefix).lstrip("_") or "dwi", found
+
+
+def merge_runs(path, groups, entities):
+    """Merge rows of one confounds file that differ only in *entities*.
+
+    Returns ``[(original_file, index array, prefix override or None)]``.  A
+    merged row pools the volumes of its members, so each of its counts is the sum
+    over them, and carries the prefix with those entities stripped.
+    """
+    pattern = entity_pattern(entities)
     buckets, order = {}, []
     for original_file, idx in groups:
         ident = scan_identity(path, original_file)
-        key = pair_key(ident[2]) if ident else None
-        bucket_id = (ident[0], ident[1], key) if key else ("__single__", original_file, len(order))
-        if bucket_id not in buckets:
-            buckets[bucket_id] = []
+        key, found = sum_key(ident[2], pattern) if ident else (None, [])
+        bucket_id = (ident[0], ident[1], key) if key else ("__unpaired__", original_file, len(order))
+        buckets.setdefault(bucket_id, []).append((original_file, idx, found))
+        if len(buckets[bucket_id]) == 1:
             order.append(bucket_id)
-        buckets[bucket_id].append((original_file, idx))
 
     merged = []
     for bucket_id in order:
@@ -324,11 +344,9 @@ def merge_ap_pa(path, groups):
         if len(members) == 1:
             merged.append((members[0][0], members[0][1], None))
             continue
-        log.info("%s: summing %d phase-encoding directions (%s) into %s",
-                 os.path.basename(path), len(members),
-                 ", ".join(DIR_ENTITY_RE.search(scan_identity(path, of)[2]).group().lstrip("_")
-                           for of, _ in members), bucket_id[2])
-        merged.append((members[0][0], np.concatenate([idx for _, idx in members]), bucket_id[2]))
+        log.info("%s: summing %d rows (%s) into %s", os.path.basename(path), len(members),
+                 ", ".join("+".join(found) for *_, found in members), bucket_id[2])
+        merged.append((members[0][0], np.concatenate([idx for _, idx, _ in members]), bucket_id[2]))
     return merged
 
 
@@ -394,7 +412,7 @@ def scan_rows(path, args):
         if args.combine:
             groups = [(runs[0][0], np.arange(len(df)), None)]
         elif args.sum_ap_pa:
-            groups = merge_ap_pa(path, runs)
+            groups = merge_runs(path, runs, args.sum_entities)
         if len(groups) > 1:
             log.info("%s: %d source runs -> %d row(s)", os.path.basename(path), len(runs), len(groups))
 
@@ -482,9 +500,16 @@ def main(argv=None) -> int:
                         f"'{FD_COLUMN}' column (needed for a non-default --fd-radius)")
 
     p.add_argument("--sum-ap-pa", action="store_true",
-                   help="Merge rows of one confounds file that differ only in their dir- "
-                        "(phase-encoding) entity, e.g. dir-AP and dir-PA, by summing their counts; "
-                        "the merged prefix drops the dir- entity")
+                   help="Merge the rows of one confounds file that belong to the same acquisition "
+                        "by summing their counts: rows differing only in the --sum-entities "
+                        "entities (by default the phase-encoding dir- and the run-), so dir-AP and "
+                        "dir-PA of every run collapse into one row whose prefix drops those "
+                        "entities")
+    p.add_argument("--sum-entities", nargs="+", default=list(DEFAULT_SUM_ENTITIES),
+                   metavar="ENTITY",
+                   help=f"BIDS entities ignored when deciding which rows --sum-ap-pa may sum "
+                        f"(default: {' '.join(DEFAULT_SUM_ENTITIES)}); pass just 'dir' to keep "
+                        f"repeated runs on separate rows")
     p.add_argument("--combine", action="store_true",
                    help="One row per confounds file even when it concatenates several source "
                         "runs (default: one row per original_file, as the report is per-scan)")
@@ -494,9 +519,15 @@ def main(argv=None) -> int:
     args = p.parse_args(argv)
     if args.combine and args.sum_ap_pa:
         p.error("--combine already merges every run of a file; use one or the other")
+    bad = [e for e in args.sum_entities if not re.fullmatch(r"[A-Za-z0-9]+", e)]
+    if bad:
+        p.error(f"--sum-entities takes bare BIDS entity names (e.g. dir run), not {bad}")
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(levelname)s | %(message)s", stream=sys.stderr)
+
+    if list(args.sum_entities) != list(DEFAULT_SUM_ENTITIES) and not args.sum_ap_pa:
+        log.warning("--sum-entities has no effect without --sum-ap-pa")
 
     # the RMS->FD conversion is needed only when the two disagree
     args.needs_factor = (args.motion_measure == "fd" and args.threshold_units == "rms")
